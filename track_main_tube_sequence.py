@@ -19,6 +19,7 @@ import numpy as np
 
 import detect_main_tube as dmt
 from review_window import ReviewWindow
+from tracking_diagnostics import add_evidence, write_diagnostics
 from tracking_videos import TrackingVideos, make_unique_output_path
 
 
@@ -1224,6 +1225,7 @@ def assess_visibility(
     previous_rois: dict[str, Any],
     predicted_rois: dict[str, Any],
     max_lateral_jump: float,
+    record_metrics: bool = False,
 ) -> list[dict[str, Any]]:
     """Only publish current bilateral measurements. Confirm reacquisition on a second frame."""
     old_centers = {r["roi_idx"]: _roi_center(r) for r in previous_rois["rois"]}
@@ -1255,6 +1257,9 @@ def assess_visibility(
                     motion = new_centers[idx] - old_centers[idx]
                     shift = line.mean(axis=0) - np.mean(prev["centerline"], axis=0) - motion
                     width_ratio = result["tube_width_px"] / prev["tube_width_px"]
+                    if record_metrics:
+                        result["width_ratio"] = round(width_ratio, 4)
+                        result["lateral_shift_px"] = round(float(shift @ normal), 3)
                     if not 2 / 3 <= width_ratio <= 1.5:
                         reason = "inconsistent tube width"
                     elif max_lateral_jump > 0 and abs(shift @ normal) > max_lateral_jump:
@@ -1329,10 +1334,13 @@ def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
     prev_gray = dmt.read_image_unicode(image_paths[0], cv2.IMREAD_GRAYSCALE)
     previous_exposure_stats = measure_exposure_stats(prev_gray)
     exposure_hold_remaining = 0
-    results, _ = dmt.detect_all(prev_gray, roi_payload, config, debug_panels_enabled=False)
+    diagnostics = getattr(args, "diagnostics", False)
+    initial_rois = roi_payload["rois"]
+    planned_frames = len(image_paths)
+    raw_results, _ = dmt.detect_all(prev_gray, roi_payload, config, debug_panels_enabled=False)
     candidates: dict[int, dict[str, Any] | None] = {}
     jump_limit = getattr(args, "centerline_lateral_jump", 7.0)
-    results = assess_visibility(results, candidates, roi_payload, roi_payload, jump_limit)
+    results = assess_visibility(raw_results, candidates, roi_payload, roi_payload, jump_limit, diagnostics)
     if args.roi_update_mode == "detect-corrected":
         roi_payload, roi_updates = correct_rois_from_detections(
             roi_payload,
@@ -1351,6 +1359,8 @@ def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
     anchor_roi_payload = dmt.normalize_roi_payload(roi_payload)
     roi_span_history = update_roi_span_history({}, roi_payload)
     frames = [make_frame_centerline_summary(image_paths[0], rois_source, results)]
+    if diagnostics:
+        add_evidence(frames[-1], raw_results, previous_exposure_stats)
     _emit_progress(0, len(image_paths), image_paths[0], results, getattr(args, "progress_every", 0))
     overlay = (
         make_review_frame(prev_gray, results, image_path=image_paths[0], frame_index=0,
@@ -1372,9 +1382,7 @@ def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
                 wait_ms=args.wait_ms,
             )
             if not reviewer.show(display_frame, force_pause=_needs_pause(results, args.pause_on)):
-                payload = make_sequence_centerline_payload(frames, rois_source)
-                dmt.save_json(out_json, payload)
-                return payload
+                image_paths = image_paths[:1]
 
         for frame_index, image_path in enumerate(image_paths[1:], start=1):
             next_gray = dmt.read_image_unicode(image_path, cv2.IMREAD_GRAYSCALE)
@@ -1404,8 +1412,8 @@ def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
                 track_group_outlier_min_dy=getattr(args, "track_group_outlier_min_dy", 0.0),
                 track_group_outlier_dy_deviation=getattr(args, "track_group_outlier_dy_deviation", 45.0),
             )
-            results, _ = dmt.detect_all(next_gray, predicted_roi_payload, config, debug_panels_enabled=False)
-            results = assess_visibility(results, candidates, previous_roi_payload, predicted_roi_payload, jump_limit)
+            raw_results, _ = dmt.detect_all(next_gray, predicted_roi_payload, config, debug_panels_enabled=False)
+            results = assess_visibility(raw_results, candidates, previous_roi_payload, predicted_roi_payload, jump_limit, diagnostics)
             if args.roi_update_mode == "detect-corrected":
                 roi_payload, roi_updates = correct_rois_from_detections(
                     predicted_roi_payload,
@@ -1461,6 +1469,8 @@ def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
                     tracking=tracking,
                 )
             )
+            if diagnostics:
+                add_evidence(frames[-1], raw_results, current_exposure_stats)
             _emit_progress(frame_index, len(image_paths), image_path, results, getattr(args, "progress_every", 0))
             overlay = (
                 make_review_frame(next_gray, results, image_path=image_path, frame_index=frame_index,
@@ -1493,6 +1503,10 @@ def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
 
     payload = make_sequence_centerline_payload(frames, rois_source)
     dmt.save_json(out_json, payload)
+    if diagnostics:
+        zip_path = make_unique_output_path(out_json.with_name(out_json.stem + "_diagnostics.zip"))
+        write_diagnostics(zip_path, frames, initial_rois, planned_frames, args)
+        print(f"Diagnostics: {zip_path}")
     return payload
 
 
@@ -1530,6 +1544,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.set_defaults(window=True, video=True)
     parser.add_argument("--no-window", dest="window", action="store_false", help="Disable real-time review window.")
     parser.add_argument("--no-video", dest="video", action="store_false", help="Disable review video recording.")
+    parser.add_argument("--diagnostics", action="store_true", help="Save a shareable local ZIP with measurements and sampled ROI crops.")
     parser.add_argument(
         "--jupyter-friendly",
         action="store_true",

@@ -37,9 +37,19 @@
 
 ## 输出与后续验证
 
+### 大数据序列的诊断包
+
+在现场电脑运行 `.\run_testbmp_live.cmd -ImageDir "D:\采集数据\第二组" -Diagnostics`。使用已有选区批处理时，在上面的无窗口命令末尾加 `-Diagnostics -NoVideo`。从本次运行目录取 `*_diagnostics.zip`，即可离线分析。程序在本机生成这个文件，由操作者决定是否分享。
+
+- `summary.json` 记录实际处理帧数、参数、跟踪代码指纹、初始选区、各 ROI 的丢失次数与时段统计。`lost` 是丢失帧数，`loss_runs` 是连续丢失的段数，`longest_loss` 是最长一段的起止帧（含两端）。
+- `measurements.csv` 每帧每个 ROI 一行，帧号从 1 开始。排查时将 `reason` 与候选管宽、双壁覆盖率、相邻候选管宽比及横向位移对照。运动估计状态、校正结果和曝光指标用于判断搜索框漂移或画面亮度变化。空值表示该步骤没有测量；`lost` 时中心线坐标为空，即使本帧产生过候选。
+- `samples/` 全包最多 32 张局部图，文件名包含帧号、ROI 和状态。每张左半是局部原图，右半是同一区域的搜索框及最终发布的线。抽样涵盖丢失前后、恢复及正常状态。检查 `ok` 样本中中心线是否仍在人工选定的管道上，有助于发现高置信误跟。输入图在打包时需保持可读，取样失败会记在 `sample_errors`。
+
+如操作者看到某帧有偏差，记录视频中的帧号、ROI 编号和预期位置。若该帧未抽中，可补充该 ROI 的一张局部截图。
+
 启动脚本默认将每次结果放入 `tracking_results/runs/<启动时间>/`。此前的六组结果集中在 `tracking_results/archive/`。上述参考运行的本机目录为 `tracking_results/runs/20261125_112342_702/`，其中 `roi_review_*.mp4` 用于逐根检查管壁，`tracking_review_*.mp4` 用于核对全图位置，`sequence_centerlines_*.json` 用于按帧查询 `roi_idx`、`status`、`failure_reason` 和 `wall_pair_coverage`。
 
-修改前按项目约定先用 ponytail 审查。修改后在根目录执行以下命令。本次交接时 67 项自动化测试通过，Ruff 检查通过。
+修改前按项目约定先用 ponytail 审查。修改后在根目录执行以下命令。加入诊断功能后，69 项自动化测试通过，Ruff 检查通过。用首次选区复跑 201 帧，诊断包共 2,010 条测量记录、32 张局部图，约 0.60 MB。开启诊断后的 2,010 个状态及中心线与参考运行逐项一致。
 
 ```powershell
 python -m unittest -q

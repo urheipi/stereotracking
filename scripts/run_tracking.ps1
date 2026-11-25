@@ -9,6 +9,7 @@ param(
     [int]$ProgressEvery = 10,
     [double]$TrackScale = 1,
     [switch]$NoVideo,
+    [switch]$Diagnostics,
     [switch]$Interactive
 )
 
@@ -61,6 +62,9 @@ if ($Interactive) {
 
 if ($NoVideo) {
     $CliArgs += "--no-video"
+}
+if ($Diagnostics) {
+    $CliArgs += "--diagnostics"
 }
 
 & $Python @CliArgs

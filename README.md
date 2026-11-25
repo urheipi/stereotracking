@@ -16,6 +16,16 @@
 
 每次运行的结果保存在 **`tracking_results/runs/<启动时间>/`**。全局视频为 `tracking_review_*.mp4`，局部放大视频为 `roi_review_*.mp4`，逐帧结果为 `sequence_centerlines_*.json`。手动框选时还会生成 `drawn_rois.json`。历史结果已归到 `tracking_results/archive/`。
 
+### 真实数据较大时如何分享诊断结果
+
+在现场电脑打开项目目录的 PowerShell，开启诊断模式。默认仍会录制两份视频，只想查看预览并导出诊断包时可再加 `-NoVideo`。
+
+```powershell
+.\run_testbmp_live.cmd -ImageDir "D:\采集数据\第二组" -Diagnostics
+```
+
+运行完成后，分享本次 `tracking_results/runs/<启动时间>/` 内的 **`*_diagnostics.zip`** 即可。里面有逐帧测量表、各选区的丢失统计，以及最多 32 张局部原图与画线结果。程序只在本机打包。若你在预览中看到了误跟，附上帧号、ROI 编号和希望跟踪的管道位置，会更容易定位。字段说明见 [handoff.md](handoff.md)。
+
 ## 项目实现了什么功能
 
 本项目用于在图像中的多边形 ROI 内检测主导管的左右边界和中心线，并支持把首帧 ROI 跟踪到后续图像序列中，逐帧输出主导管中心线结果。

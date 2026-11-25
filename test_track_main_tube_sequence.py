@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import io
 import json
 from pathlib import Path
@@ -6,11 +7,54 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+from zipfile import ZipFile
 
 import cv2
 import numpy as np
 
 import track_main_tube_sequence as tracker
+import tracking_diagnostics as diagnostics
+
+
+class DiagnosticsTest(unittest.TestCase):
+    def test_local_bundle_preserves_rejected_evidence_and_has_no_source_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "private-input"
+            src.mkdir()
+            images = []
+            for i, visible in enumerate([True, False, True, True]):
+                gray = np.full((160, 120), 225, np.uint8)
+                gray[:, 45:75 if visible else 120] = 50
+                p = src / f"private-{i}.png"
+                tracker.dmt.write_image_unicode(p, gray)
+                images.append(str(p))
+            rois = root / "rois.json"
+            rois.write_text(json.dumps({"rois": [{"roi_idx": 4, "vertices": [[30, 10], [90, 10], [90, 150], [30, 150]]}]}))
+            args = tracker.parse_args(["--images", *images, "--initial-rois", str(rois), "--out-dir", tmp,
+                                       "--roi-update-mode", "flow", "--no-window", "--no-video", "--diagnostics"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                tracker.run_sequence(args)
+            with ZipFile(next(root.glob("*_diagnostics.zip"))) as bundle:
+                summary = bundle.read("summary.json").decode()
+                self.assertNotIn("private-", summary)
+                self.assertNotIn(str(root.name), summary)
+                stats = json.loads(summary)["by_roi"]["4"]
+                self.assertEqual((stats["lost"], stats["longest_loss"], stats["first_recovery"]), (2, [2, 3], 4))
+                rows = list(csv.DictReader(io.StringIO(bundle.read("measurements.csv").decode())))
+                self.assertEqual(rows[2]["reason"], "awaiting second wall measurement")
+                self.assertTrue(float(rows[2]["candidate_tube_width_px"]) > 0)
+                self.assertEqual(rows[2]["center_x1"], "")
+                jpeg = bundle.read("samples/F000002_R4_lost.jpg")
+                self.assertIsNotNone(cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR))
+
+    def test_image_budget_is_shared_across_rois(self):
+        items = [{"roi_idx": idx, "status": "ok", "wall_pair_coverage": .8} for idx in range(100)]
+        frames = [{"centerlines": items}] * 5
+        stats, samples = diagnostics._summarize(frames)
+        self.assertEqual(len(stats), 100)
+        self.assertEqual(len(samples), diagnostics.MAX_SAMPLES)
+        self.assertEqual(len(set(samples)), len(samples))
 
 
 class TrackingVideosTest(unittest.TestCase):
