@@ -18,6 +18,8 @@ import cv2
 import numpy as np
 
 import detect_main_tube as dmt
+from review_window import ReviewWindow
+from tracking_videos import TrackingVideos, make_unique_output_path
 
 
 DEFAULT_OUTPUT_JSON = "sequence_centerlines.json"
@@ -26,7 +28,6 @@ DEFAULT_OUTPUT_JSON_STEM = "sequence_centerlines"
 DEFAULT_OUTPUT_JSON_SUFFIX = ".json"
 DEFAULT_OUTPUT_VIDEO_STEM = "tracking_review"
 DEFAULT_OUTPUT_VIDEO_SUFFIX = ".mp4"
-WINDOW_NAME = "Main Tube Sequence Review"
 CONFIDENCE_RANK = {"failed": 0, "low": 1, "medium": 2, "high": 3}
 EXPOSURE_SATURATION_LEVEL = 250
 
@@ -85,16 +86,6 @@ def default_output_video_name(run_timestamp: str | None = None) -> str:
     return f"{DEFAULT_OUTPUT_VIDEO_STEM}_{timestamp}{DEFAULT_OUTPUT_VIDEO_SUFFIX}"
 
 
-def make_unique_output_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-    for index in range(2, 1000):
-        candidate = path.with_name(f"{path.stem}_{index:03d}{path.suffix}")
-        if not candidate.exists():
-            return candidate
-    raise FileExistsError(f"No available output filename near {path}")
-
-
 def resolve_output_video(
     out_video: str | Path | None,
     out_dir: str | Path | None,
@@ -112,9 +103,9 @@ def resolve_output_video(
 
 def _tracking_text(tracking: list[dict[str, Any]]) -> str:
     if not tracking:
-        return "track: initial"
+        return "ROI motion: initial"
     ok_count = sum(1 for item in tracking if item.get("status") == "ok")
-    return f"track: {ok_count}/{len(tracking)} ok"
+    return f"ROI motion: {ok_count}/{len(tracking)} ok"
 
 
 def _needs_pause(results: list[dict[str, Any]], pause_on: str) -> bool:
@@ -141,16 +132,20 @@ def make_review_frame(
     ok_count = sum(1 for result in results if result.get("status") == "ok")
     header = (
         f"{frame_index + 1}/{total_frames}  {Path(image_path).name}  "
-        f"detect: {ok_count}/{len(results)} ok  {_tracking_text(tracking)}"
+        f"visible: {ok_count}/{len(results)}   lost: {len(results) - ok_count}   {_tracking_text(tracking)}"
     )
     cv2.rectangle(frame, (0, 0), (frame.shape[1], 42), (0, 0, 0), -1)
     cv2.putText(frame, header, (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (255, 255, 255), 2, cv2.LINE_AA)
 
-    if video_scale != 1.0:
-        width = max(1, int(round(frame.shape[1] * video_scale)))
-        height = max(1, int(round(frame.shape[0] * video_scale)))
-        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-    return frame
+    return _scale_review_frame(frame, video_scale)
+
+
+def _scale_review_frame(frame: np.ndarray, scale: float) -> np.ndarray:
+    if scale == 1.0:
+        return frame
+    width = max(1, int(round(frame.shape[1] * scale)))
+    height = max(1, int(round(frame.shape[0] * scale)))
+    return cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
 
 
 def _emit_progress(
@@ -170,79 +165,6 @@ def _emit_progress(
         f"[{frame_number}/{total_frames}] {Path(image_path).name} ok={ok_count}/{len(results)}",
         flush=True,
     )
-
-
-class ReviewWindow:
-    def __init__(
-        self,
-        image_shape: tuple[int, int],
-        *,
-        max_width: int,
-        max_height: int,
-        review_mode: str,
-        wait_ms: int,
-    ) -> None:
-        height, width = image_shape
-        self.viewport = dmt.RoiViewport.for_image(width, height, max_width=max_width, max_height=max_height)
-        self.review_mode = review_mode
-        self.wait_ms = max(1, int(wait_ms))
-        self.continuous = review_mode == "continuous"
-        self.dragging = False
-        self.drag_start: tuple[int, int] | None = None
-        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WINDOW_NAME, self.viewport.canvas_width, self.viewport.canvas_height)
-        cv2.setMouseCallback(WINDOW_NAME, self._on_mouse)
-
-    def _on_mouse(self, event: int, x: int, y: int, flags: int, _param: Any) -> None:
-        if event == cv2.EVENT_MOUSEWHEEL:
-            self.viewport.zoom_at(x, y, 1.2 if flags > 0 else 1 / 1.2)
-        elif event == cv2.EVENT_RBUTTONDOWN:
-            self.dragging = True
-            self.drag_start = (x, y)
-        elif event == cv2.EVENT_MOUSEMOVE and self.dragging and self.drag_start is not None:
-            last_x, last_y = self.drag_start
-            self.viewport.pan(x - last_x, y - last_y)
-            self.drag_start = (x, y)
-        elif event == cv2.EVENT_RBUTTONUP:
-            self.dragging = False
-            self.drag_start = None
-
-    def _draw(self, frame: np.ndarray) -> None:
-        cv2.imshow(WINDOW_NAME, self.viewport.render(frame))
-
-    def show(self, frame: np.ndarray, *, force_pause: bool) -> bool:
-        pause = force_pause or not self.continuous
-        while True:
-            self._draw(frame)
-            key = cv2.waitKey(0 if pause else self.wait_ms) & 0xFF
-            if key in (ord("q"), 27):
-                return False
-            if key in (ord("n"), ord(" "), 13):
-                return True
-            if key == ord("c"):
-                self.continuous = True
-                return True
-            if key == ord("p"):
-                self.continuous = False
-                pause = True
-                continue
-            if key == ord("r"):
-                self.viewport.reset()
-                continue
-            if not pause:
-                return True
-
-    def close(self) -> None:
-        cv2.destroyWindow(WINDOW_NAME)
-
-
-def _open_video_writer(path: Path, frame: np.ndarray, fps: float) -> cv2.VideoWriter:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(path), fourcc, float(fps), (frame.shape[1], frame.shape[0]))
-    if not writer.isOpened():
-        raise ValueError(f"Could not open video writer: {path}")
-    return writer
 
 
 def make_frame_centerline_summary(
@@ -265,6 +187,7 @@ def make_frame_centerline_summary(
         if result.get("fallback_reason"):
             item["fallback_reason"] = result["fallback_reason"]
         for key in (
+            "wall_pair_coverage",
             "centerline_guard_status",
             "centerline_lateral_jump",
             "centerline_lateral_jump_limit",
@@ -382,6 +305,13 @@ def _template_match_roi_transform(
             "failure_reason": "template match score too low",
         }
 
+    # A featureless wall gives the same match at many offsets. Moving the
+    # search box to an arbitrary maximum can prevent a visible tube returning.
+    ys, xs = np.nonzero(scores >= score - 1e-6)
+    if np.ptp(xs) > 2 or np.ptp(ys) > 2:
+        return None, {"status": "failed", "method": "template", "template_score": score,
+                      "failure_reason": "ambiguous template position"}
+
     dx = float(sx0 + max_loc[0] - x0)
     dy = float(sy0 + max_loc[1] - y0)
     matrix = np.asarray([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
@@ -424,10 +354,23 @@ def _estimate_roi_transform(
     lk_window_size = max(5, int(lk_window_size))
     if lk_window_size % 2 == 0:
         lk_window_size += 1
+    # LK builds image pyramids on every call. Keep the displacement allowance
+    # and the coarsest window's support around the ROI, in both frames.
+    flow_prev, flow_next = prev_gray, next_gray
+    origin = np.zeros(2, dtype=np.float32)
+    if max_roi_jump is not None:
+        height, width = prev_gray.shape
+        stride = 1 << min(int(lk_max_level), max(height, width).bit_length())
+        margin = int(np.ceil(max_roi_jump)) + (lk_window_size // 2 + 3) * stride
+        lo = np.maximum(0, (np.floor(prev_points.min(axis=0)).astype(int) - margin) // stride * stride)
+        hi = np.ceil(prev_points.max(axis=0)).astype(int) + margin + 1
+        region = np.s_[lo[1]:hi[1], lo[0]:hi[0]]
+        origin = lo.astype(np.float32)
+        flow_prev, flow_next = prev_gray[region], next_gray[region]
     next_points, status, _ = cv2.calcOpticalFlowPyrLK(
-        prev_gray,
-        next_gray,
-        prev_points.reshape(-1, 1, 2),
+        flow_prev,
+        flow_next,
+        (prev_points - origin).reshape(-1, 1, 2),
         None,
         winSize=(lk_window_size, lk_window_size),
         maxLevel=int(lk_max_level),
@@ -448,8 +391,8 @@ def _estimate_roi_transform(
         }
 
     back_points, back_status, _ = cv2.calcOpticalFlowPyrLK(
-        next_gray,
-        prev_gray,
+        flow_next,
+        flow_prev,
         next_points,
         None,
         winSize=(lk_window_size, lk_window_size),
@@ -458,10 +401,10 @@ def _estimate_roi_transform(
     )
 
     prev_flat = prev_points.reshape(-1, 2)
-    next_flat = next_points.reshape(-1, 2)
+    next_flat = next_points.reshape(-1, 2) + origin
     good = status.reshape(-1).astype(bool)
     if back_points is not None and back_status is not None:
-        back_flat = back_points.reshape(-1, 2)
+        back_flat = back_points.reshape(-1, 2) + origin
         fb_error = np.linalg.norm(back_flat - prev_flat, axis=1)
         good &= back_status.reshape(-1).astype(bool)
         good &= fb_error <= max_forward_backward_error
@@ -491,12 +434,16 @@ def _estimate_roi_transform(
         confidence=0.99,
         refineIters=10,
     )
-    if matrix is None:
+    if matrix is not None and inliers is not None and np.any(inliers):
+        keep = inliers.ravel().astype(bool)
+        tracked_prev, tracked_next = tracked_prev[keep], tracked_next[keep]
+    inlier_count = len(tracked_prev)
+    # A cluster at one tube end measures local translation, but extrapolating
+    # its scale and rotation can move the opposite wall out of the search box.
+    footprint = np.linalg.norm(np.ptp(tracked_prev, axis=0))
+    if matrix is None or footprint < np.linalg.norm(np.ptp(vertices, axis=0)) / 3:
         delta = np.median(tracked_next - tracked_prev, axis=0)
         matrix = np.asarray([[1.0, 0.0, delta[0]], [0.0, 1.0, delta[1]]], dtype=np.float32)
-        inlier_count = int(len(tracked_prev))
-    else:
-        inlier_count = int(inliers.sum()) if inliers is not None else int(len(tracked_prev))
 
     return matrix.astype(np.float32), {
         "status": "ok",
@@ -620,7 +567,7 @@ def track_rois_between_frames(
     max_roi_jump: float | None = None,
     lk_window_size: int = 31,
     lk_max_level: int = 4,
-    track_group_outlier_min_dy: float = 55.0,
+    track_group_outlier_min_dy: float = 0.0,
     track_group_outlier_dy_deviation: float = 45.0,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if track_scale <= 0:
@@ -1263,330 +1210,69 @@ def _merge_roi_update_info(tracking: list[dict[str, Any]], updates: list[dict[st
     return merged
 
 
-def _translate_roi_vertices(vertices: list[list[float]], delta: np.ndarray) -> list[list[float]]:
-    points = np.asarray(vertices, dtype=np.float32).reshape(-1, 2) + delta.astype(np.float32)
-    return _format_vertices(points)
+def _lost_measurement(result: dict[str, Any], reason: str) -> dict[str, Any]:
+    lost = dmt._failed_roi_result(result["roi_idx"], result["vertices"], reason)
+    lost.update(status="lost", confidence="lost")
+    if "wall_pair_coverage" in result:
+        lost["wall_pair_coverage"] = result["wall_pair_coverage"]
+    return lost
 
 
-def apply_group_vertical_motion_prior(
-    roi_payload: dict[str, Any],
-    anchor_payload: dict[str, Any],
-    *,
-    history_payload: dict[str, Any] | None = None,
-    min_group_drift: float = 25.0,
-    floor_frac: float = 0.85,
-    tolerance: float = 6.0,
-    history_tolerance: float = 2.0,
-    max_adjustment: float | None = None,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    normalized = dmt.normalize_roi_payload(roi_payload)
-    anchors = {
-        int(roi["roi_idx"]): roi
-        for roi in dmt.normalize_roi_payload(anchor_payload).get("rois", [])
-    }
-    history = (
-        {
-            int(roi["roi_idx"]): roi
-            for roi in dmt.normalize_roi_payload(history_payload).get("rois", [])
-        }
-        if history_payload is not None
-        else {}
-    )
-
-    drifts: list[float] = []
-    for roi in normalized.get("rois", []):
-        anchor = anchors.get(int(roi["roi_idx"]))
-        if anchor is None:
-            continue
-        drift = float(_roi_center(roi)[1] - _roi_center(anchor)[1])
-        if np.isfinite(drift):
-            drifts.append(drift)
-
-    if not drifts:
-        return normalized, []
-
-    group_drift = float(np.median(np.asarray(drifts, dtype=np.float32)))
-    if group_drift <= float(min_group_drift):
-        return normalized, []
-
-    target_drift = group_drift * max(0.0, float(floor_frac))
-    max_shift = float(max_adjustment) if max_adjustment is not None else None
-    adjusted_rois: list[dict[str, Any]] = []
-    updates: list[dict[str, Any]] = []
-
-    for roi in normalized.get("rois", []):
-        roi_copy = _roi_copy(roi)
-        roi_idx = int(roi_copy["roi_idx"])
-        anchor = anchors.get(roi_idx)
-        if anchor is None:
-            adjusted_rois.append(roi_copy)
-            continue
-
-        current_drift = float(_roi_center(roi_copy)[1] - _roi_center(anchor)[1])
-        shift_y = 0.0
-        reasons: list[str] = []
-
-        drift_shift_y = target_drift - current_drift
-        if drift_shift_y > float(tolerance):
-            shift_y = max(shift_y, drift_shift_y)
-            reasons.append("group-drift-floor")
-
-        history_roi = history.get(roi_idx)
-        if history_roi is not None:
-            history_floor_y = float(_roi_center(history_roi)[1]) - float(history_tolerance)
-            history_shift_y = history_floor_y - float(_roi_center(roi_copy)[1])
-            if history_shift_y > 0:
-                shift_y = max(shift_y, history_shift_y)
-                reasons.append("history-floor")
-
-        if shift_y <= 0:
-            adjusted_rois.append(roi_copy)
-            continue
-
-        if max_shift is not None:
-            shift_y = min(shift_y, max_shift)
-        roi_copy["vertices"] = _translate_roi_vertices(roi_copy["vertices"], np.asarray([0.0, shift_y], dtype=np.float32))
-        adjusted_rois.append(roi_copy)
-        updates.append(
-            {
-                "roi_idx": roi_idx,
-                "motion_prior_status": "group-vertical-adjusted",
-                "motion_prior_shift_y": round(float(shift_y), 3),
-                "motion_prior_group_drift_y": round(group_drift, 3),
-                "motion_prior_current_drift_y": round(current_drift, 3),
-                "motion_prior_target_drift_y": round(target_drift, 3),
-                "motion_prior_reasons": reasons,
-            }
-        )
-
-    return {"num_rois": len(adjusted_rois), "rois": adjusted_rois}, updates
-
-
-def update_vertical_motion_history(
-    history_payload: dict[str, Any],
-    roi_payload: dict[str, Any],
-) -> dict[str, Any]:
-    history_by_idx = {
-        int(roi["roi_idx"]): _roi_copy(roi)
-        for roi in dmt.normalize_roi_payload(history_payload).get("rois", [])
-    }
-    for roi in dmt.normalize_roi_payload(roi_payload).get("rois", []):
-        roi_copy = _roi_copy(roi)
-        roi_idx = int(roi_copy["roi_idx"])
-        history_roi = history_by_idx.get(roi_idx)
-        if history_roi is None or float(_roi_center(roi_copy)[1]) > float(_roi_center(history_roi)[1]):
-            history_by_idx[roi_idx] = roi_copy
-
-    rois = [history_by_idx[roi_idx] for roi_idx in sorted(history_by_idx)]
-    return {"num_rois": len(rois), "rois": rois}
-
-
-def _translate_points(points: Any, delta: np.ndarray) -> list[list[float]]:
-    translated = np.asarray(points, dtype=np.float32).reshape(-1, 2) + delta.astype(np.float32)
-    return _format_vertices(translated)
-
-
-def _centerline_array(result: dict[str, Any]) -> np.ndarray | None:
-    centerline = np.asarray(result.get("centerline", []), dtype=np.float32)
-    if centerline.ndim != 2 or len(centerline) < 2 or centerline.shape[1:] != (2,):
-        return None
-    if not np.all(np.isfinite(centerline)):
-        return None
-    return centerline
-
-
-def guard_centerline_lateral_jumps(
+def assess_visibility(
     results: list[dict[str, Any]],
-    previous_results_by_idx: dict[int, dict[str, Any]],
-    previous_roi_payload: dict[str, Any],
-    current_roi_payload: dict[str, Any],
-    *,
+    candidates: dict[int, dict[str, Any] | None],
+    previous_rois: dict[str, Any],
+    predicted_rois: dict[str, Any],
     max_lateral_jump: float,
 ) -> list[dict[str, Any]]:
-    if max_lateral_jump <= 0:
-        return results
-
-    previous_rois = {
-        int(roi["roi_idx"]): roi
-        for roi in dmt.normalize_roi_payload(previous_roi_payload).get("rois", [])
-    }
-    current_rois = {
-        int(roi["roi_idx"]): roi
-        for roi in dmt.normalize_roi_payload(current_roi_payload).get("rois", [])
-    }
-
-    guarded: list[dict[str, Any]] = []
+    """Only publish current bilateral measurements. Confirm reacquisition on a second frame."""
+    old_centers = {r["roi_idx"]: _roi_center(r) for r in previous_rois["rois"]}
+    new_centers = {r["roi_idx"]: _roi_center(r) for r in predicted_rois["rois"]}
+    visible = []
     for result in results:
-        roi_idx = int(result.get("roi_idx", 0))
-        previous_result = previous_results_by_idx.get(roi_idx)
-        previous_roi = previous_rois.get(roi_idx)
-        current_roi = current_rois.get(roi_idx)
-        current_centerline = _centerline_array(result)
-        previous_centerline = _centerline_array(previous_result or {})
-        if (
-            result.get("status") != "ok"
-            or previous_result is None
-            or previous_roi is None
-            or current_roi is None
-            or current_centerline is None
-            or previous_centerline is None
-        ):
-            guarded.append(result)
-            continue
+        idx = result["roi_idx"]
+        if result.get("status") != "ok":
+            reason = result.get("failure_reason", "no wall pair")
+        elif result.get("confidence") not in {"high", "medium"}:
+            reason = "weak wall detection"
+        elif result["wall_pair_coverage"] < 0.20:
+            reason = "insufficient simultaneous wall contrast"
+        else:
+            reason = None
 
-        delta = _roi_center(current_roi) - _roi_center(previous_roi)
-        predicted_centerline = previous_centerline + delta.astype(np.float32)
-        current_center = current_centerline.mean(axis=0)
-        predicted_center = predicted_centerline.mean(axis=0)
-        direction = current_centerline[-1] - current_centerline[0]
-        direction_norm = float(np.linalg.norm(direction))
-        if direction_norm <= 1e-6:
-            guarded.append(result)
-            continue
-
-        normal = np.asarray([-direction[1], direction[0]], dtype=np.float32) / direction_norm
-        lateral_jump = float(np.dot(current_center - predicted_center, normal))
-        if abs(lateral_jump) <= float(max_lateral_jump):
-            guarded.append(result)
-            continue
-
-        guarded.append(
-            {
-                **result,
-                "centerline": _format_vertices(predicted_centerline),
-                "centerline_guard_status": "temporal-lateral-clamped",
-                "centerline_lateral_jump": round(lateral_jump, 3),
-                "centerline_lateral_jump_limit": round(float(max_lateral_jump), 3),
-                "centerline_original_source": result.get("centerline_source"),
-                "centerline_source": "temporal-propagated",
-            }
-        )
-
-    return guarded
+        if reason is not None:
+            candidates[idx] = None
+        else:
+            if idx in candidates:
+                prev = candidates[idx]
+                if prev is None:
+                    reason = "awaiting second wall measurement"
+                else:
+                    # Compensate for search-window motion before checking the lateral shift.
+                    line = np.asarray(result["centerline"])
+                    direction = line[-1] - line[0]
+                    normal = np.array([-direction[1], direction[0]]) / max(np.linalg.norm(direction), 1e-6)
+                    motion = new_centers[idx] - old_centers[idx]
+                    shift = line.mean(axis=0) - np.mean(prev["centerline"], axis=0) - motion
+                    width_ratio = result["tube_width_px"] / prev["tube_width_px"]
+                    if not 2 / 3 <= width_ratio <= 1.5:
+                        reason = "inconsistent tube width"
+                    elif max_lateral_jump > 0 and abs(shift @ normal) > max_lateral_jump:
+                        reason = "inconsistent lateral position"
+            # Keep a strong but unconfirmed candidate for one-frame confirmation only.
+            candidates[idx] = result
+        visible.append(_lost_measurement(result, reason) if reason else result)
+    return visible
 
 
-def _trusted_detection_results(results: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
-    trusted: dict[int, dict[str, Any]] = {}
-    for result in results:
-        if result.get("status") == "ok" and result.get("confidence") in {"medium", "high"}:
-            trusted[int(result["roi_idx"])] = result
-    return trusted
-
-
-def _propagated_detection_results(results: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
-    propagated: dict[int, dict[str, Any]] = {}
-    for result in results:
-        if result.get("status") == "ok" and result.get("confidence") == "tracked":
-            propagated[int(result["roi_idx"])] = result
-    return propagated
-
-
-def _real_detection_results(results: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
-    real: dict[int, dict[str, Any]] = {}
-    for result in results:
-        if result.get("status") == "ok" and result.get("confidence") != "tracked":
-            real[int(result["roi_idx"])] = result
-    return real
-
-
-def apply_tracked_fallbacks(
-    results: list[dict[str, Any]],
-    previous_results_by_idx: dict[int, dict[str, Any]],
-    previous_roi_payload: dict[str, Any],
-    predicted_roi_payload: dict[str, Any],
-    tracking: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    previous_rois = {int(roi["roi_idx"]): roi for roi in dmt.normalize_roi_payload(previous_roi_payload).get("rois", [])}
-    predicted_rois = {int(roi["roi_idx"]): roi for roi in dmt.normalize_roi_payload(predicted_roi_payload).get("rois", [])}
-    tracking_by_idx = {int(item.get("roi_idx", 0)): item for item in tracking}
-
-    fallback_results: list[dict[str, Any]] = []
-    for result in results:
-        roi_idx = int(result.get("roi_idx", 0))
-        previous_result = previous_results_by_idx.get(roi_idx)
-        previous_roi = previous_rois.get(roi_idx)
-        predicted_roi = predicted_rois.get(roi_idx)
-        track_info = tracking_by_idx.get(roi_idx, {})
-        stationary_prediction = (
-            previous_roi is not None
-            and predicted_roi is not None
-            and float(np.linalg.norm(_roi_center(predicted_roi) - _roi_center(previous_roi))) <= 1e-3
-        )
-        if (
-            result.get("status") == "ok"
-            or previous_result is None
-            or previous_roi is None
-            or predicted_roi is None
-            or (track_info.get("status") != "ok" and not stationary_prediction)
-        ):
-            fallback_results.append(result)
-            continue
-
-        delta = _roi_center(predicted_roi) - _roi_center(previous_roi)
-        fallback = {
-            **result,
-            "status": "ok",
-            "confidence": "tracked",
-            "fallback_reason": result.get("failure_reason", "detection failed"),
-            "vertices": _roi_copy(predicted_roi)["vertices"],
-            "left_boundary": _translate_points(previous_result.get("left_boundary", []), delta),
-            "right_boundary": _translate_points(previous_result.get("right_boundary", []), delta),
-            "centerline": _translate_points(previous_result.get("centerline", []), delta),
-        }
-        fallback_results.append(fallback)
-
-    return fallback_results
-
-
-def apply_update_rejection_fallbacks(
-    results: list[dict[str, Any]],
-    updates: list[dict[str, Any]],
-    previous_results_by_idx: dict[int, dict[str, Any]],
-    previous_roi_payload: dict[str, Any],
-    corrected_roi_payload: dict[str, Any],
-) -> list[dict[str, Any]]:
-    rejected_statuses = {
-        "rejected-anchor-drift",
-        "rejected-roi-jump",
-        "rejected-corrected-roi",
-        "rejected-corrected-roi-shrink",
-        "rejected-exposure-shrink",
-        "rejected-long-span-history-shrink",
-    }
-    rejected_by_idx = {
-        int(update["roi_idx"]): update
-        for update in updates
-        if update.get("update_status") in rejected_statuses
-    }
-    previous_rois = {int(roi["roi_idx"]): roi for roi in dmt.normalize_roi_payload(previous_roi_payload).get("rois", [])}
-    corrected_rois = {int(roi["roi_idx"]): roi for roi in dmt.normalize_roi_payload(corrected_roi_payload).get("rois", [])}
-
-    fallback_results: list[dict[str, Any]] = []
-    for result in results:
-        roi_idx = int(result.get("roi_idx", 0))
-        update = rejected_by_idx.get(roi_idx)
-        previous_result = previous_results_by_idx.get(roi_idx)
-        previous_roi = previous_rois.get(roi_idx)
-        corrected_roi = corrected_rois.get(roi_idx)
-        if update is None or previous_result is None or previous_roi is None or corrected_roi is None:
-            fallback_results.append(result)
-            continue
-
-        delta = _roi_center(corrected_roi) - _roi_center(previous_roi)
-        fallback_results.append(
-            {
-                **result,
-                "status": "ok",
-                "confidence": "tracked",
-                "fallback_reason": update.get("update_status", "rejected-update"),
-                "vertices": _roi_copy(corrected_roi)["vertices"],
-                "left_boundary": _translate_points(previous_result.get("left_boundary", []), delta),
-                "right_boundary": _translate_points(previous_result.get("right_boundary", []), delta),
-                "centerline": _translate_points(previous_result.get("centerline", []), delta),
-            }
-        )
-
-    return fallback_results
+def reject_invalid_updates(results, updates, candidates):
+    rejected = {u["roi_idx"]: u["update_status"] for u in updates if u["update_status"].startswith("rejected-")}
+    for i, result in enumerate(results):
+        idx = result["roi_idx"]
+        if idx in rejected:
+            if result["status"] == "ok":
+                results[i] = _lost_measurement(result, rejected[idx])
+            candidates[idx] = None
 
 
 def load_initial_roi_payload(
@@ -1631,14 +1317,22 @@ def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     reviewer: ReviewWindow | None = None
-    writer: cv2.VideoWriter | None = None
     out_video = resolve_output_video(args.out_video, args.out_dir, run_timestamp=run_timestamp)
+    writer = (
+        TrackingVideos(out_video, args.fps, roi_payload["rois"], image_paths)
+        if args.video else None
+    )
     args._resolved_out_video = out_video
+    if writer is not None:
+        args._resolved_roi_video = writer.roi_path
 
     prev_gray = dmt.read_image_unicode(image_paths[0], cv2.IMREAD_GRAYSCALE)
     previous_exposure_stats = measure_exposure_stats(prev_gray)
     exposure_hold_remaining = 0
-    results, _ = dmt.detect_all(prev_gray, roi_payload, config)
+    results, _ = dmt.detect_all(prev_gray, roi_payload, config, debug_panels_enabled=False)
+    candidates: dict[int, dict[str, Any] | None] = {}
+    jump_limit = getattr(args, "centerline_lateral_jump", 7.0)
+    results = assess_visibility(results, candidates, roi_payload, roi_payload, jump_limit)
     if args.roi_update_mode == "detect-corrected":
         roi_payload, roi_updates = correct_rois_from_detections(
             roi_payload,
@@ -1652,44 +1346,23 @@ def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
             min_corrected_roi_long_span_ratio=getattr(args, "min_corrected_roi_long_span_ratio", 0.0),
             min_corrected_roi_long_span_drop=getattr(args, "min_corrected_roi_long_span_drop", 0.0),
         )
+        reject_invalid_updates(results, roi_updates, candidates)
         _apply_roi_vertices_to_results(results, roi_payload)
     anchor_roi_payload = dmt.normalize_roi_payload(roi_payload)
-    vertical_motion_history_payload = dmt.normalize_roi_payload(roi_payload)
     roi_span_history = update_roi_span_history({}, roi_payload)
-    last_detection_results_by_idx = _trusted_detection_results(results)
     frames = [make_frame_centerline_summary(image_paths[0], rois_source, results)]
     _emit_progress(0, len(image_paths), image_paths[0], results, getattr(args, "progress_every", 0))
-    display_frame = (
-        make_review_frame(
-            prev_gray,
-            results,
-            image_path=image_paths[0],
-            frame_index=0,
-            total_frames=len(image_paths),
-            tracking=[],
-            video_scale=1.0,
-        )
-        if args.window
-        else None
+    overlay = (
+        make_review_frame(prev_gray, results, image_path=image_paths[0], frame_index=0,
+                          total_frames=len(image_paths), tracking=[])
+        if args.window or args.video else None
     )
-    video_frame = (
-        make_review_frame(
-            prev_gray,
-            results,
-            image_path=image_paths[0],
-            frame_index=0,
-            total_frames=len(image_paths),
-            tracking=[],
-            video_scale=args.video_scale,
-        )
-        if args.video
-        else None
-    )
+    display_frame = overlay if args.window else None
+    video_frame = _scale_review_frame(overlay, args.video_scale) if args.video else None
 
     try:
-        if args.video and video_frame is not None:
-            writer = _open_video_writer(out_video, video_frame, args.fps)
-            writer.write(video_frame)
+        if writer is not None and video_frame is not None:
+            writer.write(video_frame, prev_gray, results, 0)
         if args.window and display_frame is not None:
             reviewer = ReviewWindow(
                 display_frame.shape[:2],
@@ -1728,17 +1401,11 @@ def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
                 max_roi_jump=args.max_roi_jump,
                 lk_window_size=getattr(args, "lk_window_size", 31),
                 lk_max_level=getattr(args, "lk_max_level", 4),
-                track_group_outlier_min_dy=getattr(args, "track_group_outlier_min_dy", 55.0),
+                track_group_outlier_min_dy=getattr(args, "track_group_outlier_min_dy", 0.0),
                 track_group_outlier_dy_deviation=getattr(args, "track_group_outlier_dy_deviation", 45.0),
             )
-            results, _ = dmt.detect_all(next_gray, predicted_roi_payload, config)
-            results = apply_tracked_fallbacks(
-                results,
-                last_detection_results_by_idx,
-                roi_payload,
-                predicted_roi_payload,
-                tracking,
-            )
+            results, _ = dmt.detect_all(next_gray, predicted_roi_payload, config, debug_panels_enabled=False)
+            results = assess_visibility(results, candidates, previous_roi_payload, predicted_roi_payload, jump_limit)
             if args.roi_update_mode == "detect-corrected":
                 roi_payload, roi_updates = correct_rois_from_detections(
                     predicted_roi_payload,
@@ -1780,62 +1447,12 @@ def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
                     long_span_drop_threshold=getattr(args, "history_long_span_drop", 80.0),
                     short_span_ratio_threshold=getattr(args, "history_short_span_ratio", 0.85),
                 )
-                results = apply_update_rejection_fallbacks(
-                    results,
-                    roi_updates,
-                    last_detection_results_by_idx,
-                    previous_roi_payload,
-                    roi_payload,
-                )
+                reject_invalid_updates(results, roi_updates, candidates)
                 _apply_roi_vertices_to_results(results, roi_payload)
                 tracking = _merge_roi_update_info(tracking, roi_updates)
-                if getattr(args, "vertical_motion_prior", "group") == "group":
-                    prior_roi_payload, prior_updates = apply_group_vertical_motion_prior(
-                        roi_payload,
-                        anchor_roi_payload,
-                        history_payload=vertical_motion_history_payload,
-                        min_group_drift=getattr(args, "vertical_motion_min_drift", 25.0),
-                        floor_frac=getattr(args, "vertical_motion_floor_frac", 0.85),
-                        tolerance=getattr(args, "vertical_motion_tolerance", 6.0),
-                        history_tolerance=getattr(args, "vertical_motion_history_tolerance", 2.0),
-                        max_adjustment=args.max_roi_jump,
-                    )
-                    if prior_updates:
-                        roi_payload = prior_roi_payload
-                        tracking = _merge_roi_update_info(tracking, prior_updates)
-                        results, _ = dmt.detect_all(next_gray, roi_payload, config)
-                        results = apply_tracked_fallbacks(
-                            results,
-                            last_detection_results_by_idx,
-                            previous_roi_payload,
-                            roi_payload,
-                            tracking,
-                        )
-                        results = apply_update_rejection_fallbacks(
-                            results,
-                            tracking,
-                            last_detection_results_by_idx,
-                            previous_roi_payload,
-                            roi_payload,
-                        )
-                        _apply_roi_vertices_to_results(results, roi_payload)
             else:
                 roi_payload = predicted_roi_payload
-            results = guard_centerline_lateral_jumps(
-                results,
-                last_detection_results_by_idx,
-                previous_roi_payload,
-                roi_payload,
-                max_lateral_jump=getattr(args, "centerline_lateral_jump", 7.0),
-            )
-            if getattr(args, "vertical_motion_prior", "group") == "group":
-                vertical_motion_history_payload = update_vertical_motion_history(
-                    vertical_motion_history_payload,
-                    roi_payload,
-                )
             roi_span_history = update_roi_span_history(roi_span_history, roi_payload)
-            last_detection_results_by_idx.update(_trusted_detection_results(results))
-            last_detection_results_by_idx.update(_propagated_detection_results(results))
             frames.append(
                 make_frame_centerline_summary(
                     image_path,
@@ -1845,34 +1462,15 @@ def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
                 )
             )
             _emit_progress(frame_index, len(image_paths), image_path, results, getattr(args, "progress_every", 0))
-            display_frame = (
-                make_review_frame(
-                    next_gray,
-                    results,
-                    image_path=image_path,
-                    frame_index=frame_index,
-                    total_frames=len(image_paths),
-                    tracking=tracking,
-                    video_scale=1.0,
-                )
-                if reviewer is not None
-                else None
+            overlay = (
+                make_review_frame(next_gray, results, image_path=image_path, frame_index=frame_index,
+                                  total_frames=len(image_paths), tracking=tracking)
+                if reviewer is not None or writer is not None else None
             )
-            video_frame = (
-                make_review_frame(
-                    next_gray,
-                    results,
-                    image_path=image_path,
-                    frame_index=frame_index,
-                    total_frames=len(image_paths),
-                    tracking=tracking,
-                    video_scale=args.video_scale,
-                )
-                if writer is not None
-                else None
-            )
+            display_frame = overlay if reviewer is not None else None
+            video_frame = _scale_review_frame(overlay, args.video_scale) if writer is not None else None
             if writer is not None and video_frame is not None:
-                writer.write(video_frame)
+                writer.write(video_frame, next_gray, results, frame_index)
             if reviewer is not None and display_frame is not None and not reviewer.show(display_frame, force_pause=_needs_pause(results, args.pause_on)):
                 prev_gray = next_gray
                 break
@@ -1980,7 +1578,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--centerline-lateral-jump",
         type=float,
         default=7.0,
-        help="Clamp output centerlines to the previous-frame prediction when lateral centerline motion exceeds this many pixels. Use 0 to disable.",
+        help="Require a second wall measurement after a motion-compensated lateral jump exceeding this many pixels. Use 0 to disable.",
     )
     parser.add_argument(
         "--track-scale",
@@ -2011,8 +1609,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--track-group-outlier-min-dy",
         type=float,
-        default=55.0,
-        help="Minimum single-frame vertical ROI motion before group outlier rejection can trigger.",
+        default=0.0,
+        help="Opt in to group outlier rejection for jointly moving targets. Default 0 tracks each ROI independently.",
     )
     parser.add_argument(
         "--track-group-outlier-dy-deviation",
@@ -2079,36 +1677,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Maximum corrected ROI center drift from the first-frame anchor ROI in pixels. Default 0 disables this for moving targets.",
-    )
-    parser.add_argument(
-        "--vertical-motion-prior",
-        choices=["none", "group"],
-        default="group",
-        help="Use the group ROI downward trend to rescue ROIs whose local vertical tracking gets stuck.",
-    )
-    parser.add_argument(
-        "--vertical-motion-min-drift",
-        type=float,
-        default=15.0,
-        help="Minimum median group downward drift from the anchor before vertical motion prior is applied.",
-    )
-    parser.add_argument(
-        "--vertical-motion-floor-frac",
-        type=float,
-        default=0.85,
-        help="Minimum fraction of median group downward drift each ROI should keep once the prior is active.",
-    )
-    parser.add_argument(
-        "--vertical-motion-tolerance",
-        type=float,
-        default=4.0,
-        help="Allowed pixels below the vertical motion prior target before an ROI is nudged downward.",
-    )
-    parser.add_argument(
-        "--vertical-motion-history-tolerance",
-        type=float,
-        default=2.0,
-        help="Allowed pixels above each ROI's historical lowest center before the vertical prior restores it.",
     )
     parser.add_argument(
         "--roi-padding-frac",
@@ -2230,14 +1798,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--history-short-span-ratio must be between 0 and 1.")
     if args.max_anchor_drift < 0:
         parser.error("--max-anchor-drift must be non-negative.")
-    if args.vertical_motion_min_drift < 0:
-        parser.error("--vertical-motion-min-drift must be non-negative.")
-    if not 0 <= args.vertical_motion_floor_frac <= 1:
-        parser.error("--vertical-motion-floor-frac must be between 0 and 1.")
-    if args.vertical_motion_tolerance < 0:
-        parser.error("--vertical-motion-tolerance must be non-negative.")
-    if args.vertical_motion_history_tolerance < 0:
-        parser.error("--vertical-motion-history-tolerance must be non-negative.")
     if args.exposure_mean_jump < 0:
         parser.error("--exposure-mean-jump must be non-negative.")
     if args.exposure_saturation_jump < 0:
@@ -2267,6 +1827,9 @@ def main() -> int:
         out_json = resolve_output_json(args.out_json, args.out_dir)
     print(f"Processed {payload['num_frames']} frames.")
     print(f"Results: {out_json}")
+    if args.video:
+        print(f"Global video: {args._resolved_out_video}")
+        print(f"ROI video: {args._resolved_roi_video}")
     return 0
 
 

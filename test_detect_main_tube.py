@@ -138,6 +138,28 @@ class CenterlineSummaryTest(unittest.TestCase):
 
 
 class RoiDetectionGeometryTest(unittest.TestCase):
+    def test_one_visible_wall_and_a_quantization_step_do_not_make_a_tube(self):
+        gray = np.full((190, 130), 235, dtype=np.uint8)
+        gray[:, :54] = 55
+        gray[:, 90:] = 234
+        roi = {"roi_idx": 23, "vertices": [[30, 5], [112, 5], [112, 184], [30, 184]]}
+        result, _ = dmt.detect_roi(gray, roi)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["centerline"], [])
+
+    def test_shaded_tube_crossed_by_wires_keeps_geometric_center(self):
+        gray = np.full((920, 170), 245, dtype=np.uint8)
+        gray[:, 50:115] = np.linspace(178, 38, 65).astype(np.uint8)
+        for y in (145, 310, 650):
+            cv2.line(gray, (12, y), (155, y + 90), 22, 9)
+        roi = {"roi_idx": 1, "vertices": [[38, 12], [39, 904], [128, 902], [125, 12]]}
+        config = dmt.DetectionConfig(centerline_foreground_correction=True)
+        result, _ = dmt.detect_roi(gray, roi, config)
+        self.assertEqual(result["status"], "ok")
+        center = np.asarray(result["centerline"])
+        self.assertLess(np.max(np.abs(center[:, 0] - 82)), 2)
+        self.assertGreater(np.ptp(center[:, 1]), 800)
+
     def test_sample_boundaries_uses_common_line_support_range(self):
         meta = dmt.RectifyMeta(
             center=np.asarray([0.0, 0.0], dtype=np.float32),
@@ -237,6 +259,8 @@ class RoiDetectionGeometryTest(unittest.TestCase):
 
         overlay = dmt.draw_overlay(gray, [result])
 
+        for x in (15, 55):
+            np.testing.assert_array_equal(overlay[55, x], dmt.WALL_COLOR)
         center_pixel = overlay[55, 35]
         adjacent_pixel = overlay[55, 34]
         self.assertLess(int(center_pixel[0]), 10)

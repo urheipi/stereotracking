@@ -1,13 +1,26 @@
 # main_tube_detect 项目文档
 
+## 运行跟踪
+
+双击项目根目录的 **`run_testbmp_live.cmd`**，默认读取 `testbmp` 中的 BMP 图片，按文件名时间戳排序。在首帧沿管道外围依次左击至少三个点，将两侧管壁框入选区。按 **N** 完成一根，可继续框选其他管道。按 **Enter** 开始跟踪。
+
+**更换图片文件夹**时，在项目根目录打开 PowerShell，运行同一个脚本，将引号中的路径替换为实际图片目录。新的序列会从首帧重新框选。
+
+```powershell
+.\run_testbmp_live.cmd -ImageDir "D:\采集数据\第二组"
+```
+
+默认匹配 `*.bmp`。处理 PNG 序列时，在命令末尾加上 `-Pattern "*.png"`。如需复用同机位、相同分辨率的选区，添加 `-InitialRois "选区文件的完整路径\drawn_rois.json"`。
+
+预览中两侧管壁均为青色，中心线为黄色。当前帧的管壁无法确认时，画面显示红底 **LOST**，JSON 中的 `centerline` 为 `null`。滚轮以指针为中心缩放，按住右键拖动平移，**R** 恢复全图。**P** 暂停，**N** 单步，**C** 继续，**Q** 提前结束并保存已处理的帧。
+
+每次运行的结果保存在 **`tracking_results/runs/<启动时间>/`**。全局视频为 `tracking_review_*.mp4`，局部放大视频为 `roi_review_*.mp4`，逐帧结果为 `sequence_centerlines_*.json`。手动框选时还会生成 `drawn_rois.json`。历史结果已归到 `tracking_results/archive/`。
+
 ## 项目实现了什么功能
 
 本项目用于在图像中的多边形 ROI 内检测主导管的左右边界和中心线，并支持把首帧 ROI 跟踪到后续图像序列中，逐帧输出主导管中心线结果。
 
-项目主要包含两个入口脚本：
-
-- `detect_main_tube.py`：单张图像主导管检测。
-- `track_main_tube_sequence.py`：图像序列 ROI 跟踪和逐帧中心线提取。
+序列跟踪统一从 `track_main_tube_sequence.py` 运行。它在每一帧调用 `detect_main_tube.py` 提取两侧管壁和中心线。
 
 核心能力如下：
 
@@ -30,7 +43,7 @@ main_tube_detect/
 ├── test_track_main_tube_sequence.py    # 序列跟踪相关测试
 ├── pic/                                # 示例图像
 ├── output/                             # 单图检测输出示例
-├── tracking_results*/                  # 序列跟踪输出示例
+├── tracking_results/                   # 序列跟踪输出示例
 └── docs/                               # 额外算法说明文档
 ```
 
@@ -250,7 +263,7 @@ python track_main_tube_sequence.py --image-dir pic --pattern "*.bmp" --initial-r
 序列处理默认输出到 `--out-dir`：
 
 - `sequence_centerlines.json`：每一帧的中心线摘要。
-- `tracking_review.mp4`：可选复核视频。
+- `tracking_review_*.mp4` 和 `roi_review_*.mp4`：同帧率的全画面和局部放大录像。指定自定义全局视频名时，局部视频使用同一文件名前缀加 `_rois.mp4`。
 - `drawn_rois.json`：如果使用 `--draw-rois`，会保存首帧交互绘制的 ROI。
 
 中心线摘要中的核心字段：

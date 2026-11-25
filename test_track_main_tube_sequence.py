@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -12,7 +13,121 @@ import numpy as np
 import track_main_tube_sequence as tracker
 
 
+class TrackingVideosTest(unittest.TestCase):
+    def test_both_recordings_end_on_the_frame_where_review_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            gray = np.full((160, 120), 235, np.uint8)
+            gray[:, 45:75] = 55
+            images = [root / f"{i}.png" for i in range(3)]
+            for path in images:
+                tracker.dmt.write_image_unicode(path, gray)
+            rois = root / "rois.json"
+            rois.write_text(json.dumps({"rois": [{"roi_idx": 7, "vertices": [[30, 8], [88, 8], [88, 152], [30, 152]]}]}))
+            args = tracker.parse_args(["--images", *map(str, images), "--out-dir", str(root),
+                                       "--initial-rois", str(rois)])
+            with mock.patch.object(tracker, "ReviewWindow") as window:
+                window.return_value.show.side_effect = [True, False]
+                payload = tracker.run_sequence(args)
+            self.assertEqual(payload["num_frames"], 2)
+            for path in (args._resolved_out_video, args._resolved_roi_video):
+                cap = cv2.VideoCapture(str(path))
+                try:
+                    self.assertTrue(cap.read()[0])
+                    ok, last = cap.read()
+                    self.assertTrue(ok)
+                    self.assertFalse(cap.read()[0])
+                    if path == args._resolved_roi_video:
+                        blue, green, red = cv2.split(last[90:-20])
+                        self.assertTrue(np.any((blue < 90) & (green > 135) & (red > 155)))
+                        self.assertTrue(np.any((blue > 150) & (green > 125) & (red < 100)))
+                finally:
+                    cap.release()
+
+
+class ReviewWindowTest(unittest.TestCase):
+    def test_wheel_zoom_redraws_paused_frame_before_advancing(self):
+        frame = np.zeros((80, 100, 3), dtype=np.uint8)
+        with mock.patch.multiple(cv2, namedWindow=mock.DEFAULT, resizeWindow=mock.DEFAULT,
+                                 setMouseCallback=mock.DEFAULT, imshow=mock.DEFAULT), \
+                mock.patch.object(cv2, "getWindowProperty", return_value=1):
+            window = tracker.ReviewWindow((80, 100), max_width=100, max_height=80, review_mode="step", wait_ms=1)
+            zooms = []
+
+            def wait(delay):
+                self.assertGreater(delay, 0)
+                zooms.append(window.viewport.zoom)
+                if len(zooms) == 1:
+                    window._on_mouse(cv2.EVENT_MOUSEWHEEL, 50, 40, 120, None)
+                    return -1
+                return ord("n")
+
+            with mock.patch.object(cv2, "waitKey", side_effect=wait):
+                self.assertTrue(window.show(frame, force_pause=False))
+            self.assertEqual(zooms, [1.0, 1.2])
+            self.assertEqual(cv2.imshow.call_count, 2)
+
+
 class SequenceSummaryTest(unittest.TestCase):
+    def test_independent_tubes_with_reversals_and_crossing_wires(self):
+        # Two tubes descend and reverse while a third travels in another
+        # direction. Their ground truth is known independently of the detector.
+        def box(center, axis, length, half_width):
+            normal = np.array([-axis[1], axis[0]])
+            return np.array([center + a * length * axis + b * half_width * normal
+                             for a, b in [(-1, -1), (-1, 1), (1, 1), (1, -1)]])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images, rois, truth = [], [], []
+            for i, shift in enumerate([0, 8, 16, 24, 32, 40, 30, 20, 10, 0]):
+                gray = np.full((360, 540), 226 - i, np.uint8)
+                gray[:, 360:] = 33 + i
+                expected = []
+                for idx, (center, axis, radius, intensity) in enumerate([
+                    ((82, 130 + shift), (0.3, 1), 14, 70),
+                    ((255, 132 + shift), (1, 0.3), 10, 90),
+                    ((445 - shift / 3, 165 - shift / 3), (-0.6, 1), 13, 135),
+                ], 1):
+                    c = np.float32(center)
+                    along = np.float32(axis) / np.linalg.norm(axis)
+                    cv2.fillConvexPoly(gray, box(c, along, 72, radius).round().astype(np.int32), intensity)
+                    if i == 0:
+                        rois.append({"roi_idx": idx, "vertices": box(c, along, 78, radius + 8).tolist()})
+                    expected.append([c - along * 35, c + along * 35])
+                cv2.line(gray, (363, 120), (513, 189), 18, 3)
+                path = root / f"{i}.png"
+                tracker.dmt.write_image_unicode(path, gray)
+                images.append(str(path))
+                truth.append(expected)
+            roi_path = root / "rois.json"
+            roi_path.write_text(json.dumps({"rois": rois}))
+            args = tracker.parse_args(["--images", *images, "--initial-rois", str(roi_path),
+                                       "--out-dir", tmp, "--track-scale", "1", "--no-video", "--no-window"])
+            frames = tracker.run_sequence(args)["frames"]
+            self.assertEqual(len(frames), len(truth))
+            for frame, targets in zip(frames, truth, strict=True):
+                for line, target in zip(frame["centerlines"], targets, strict=True):
+                    self.assertIn(line["confidence"], {"high", "medium"})
+                    a, b = np.reshape(line["centerline"]["endpoints"], (2, 2))
+                    v = b - a
+                    for point in target:
+                        nearest = a + np.clip((point - a) @ v / (v @ v), 0, 1) * v
+                        self.assertLess(np.linalg.norm(point - nearest), 3)
+
+    def test_local_lk_preserves_global_position_for_distant_roi(self):
+        prev = np.zeros((1200, 1400), dtype=np.uint8)
+        prev[730:810, 985:1055] = np.random.default_rng(7).integers(20, 220, (80, 70), dtype=np.uint8)
+        moved = cv2.warpAffine(prev, np.float32([[1, 0, 12], [0, 1, -8]]), (1400, 1200))
+        vertices = np.float32([[980, 725], [1060, 725], [1060, 815], [980, 815]])
+        with mock.patch.object(cv2, "calcOpticalFlowPyrLK", wraps=cv2.calcOpticalFlowPyrLK) as lk:
+            matrix, info = tracker._estimate_roi_transform(prev, moved, vertices, 40, 3, 1.5, 50)
+        self.assertEqual(info["method"], "lk")
+        self.assertEqual(lk.call_count, 2)
+        self.assertLess(lk.call_args.args[0].size, prev.size)
+        predicted = cv2.transform(vertices[None, :, :], matrix)[0]
+        np.testing.assert_allclose(predicted, vertices + [12, -8], atol=0.5)
+
     def test_sequence_payload_contains_centerline_summaries_without_samples(self):
         frame_summary = tracker.make_frame_centerline_summary(
             image_path="pic/1.bmp",
@@ -152,6 +267,20 @@ class RoiTrackingTest(unittest.TestCase):
         expected_vertices = np.asarray([[52, 48], [127, 48], [127, 123], [52, 123]], dtype=np.float32)
         self.assertTrue(np.allclose(tracked_vertices, expected_vertices, atol=3.0))
         self.assertEqual(tracking[0]["status"], "ok")
+
+    def test_cluster_at_one_end_does_not_shrink_the_whole_search_window(self):
+        gray = np.zeros((240, 120), np.uint8)
+        vertices = np.float32([[20, 10], [80, 10], [80, 225], [20, 225]])
+        points = np.float32([[31, 201], [36, 208], [33, 212], [43, 211]])
+        moved = (points - points[0]) * .72 + points[0] + [3, -4]
+        status = np.ones((len(points), 1), np.uint8)
+        with mock.patch.object(tracker, "_detect_roi_features", return_value=points), mock.patch.object(
+            cv2, "calcOpticalFlowPyrLK", side_effect=[
+                (moved.astype(np.float32), status, None), (points, status, None)]
+        ):
+            matrix, _ = tracker._estimate_roi_transform(gray, gray, vertices, 80, 3, 1.5)
+        np.testing.assert_allclose(matrix[:, :2], np.eye(2))
+        np.testing.assert_allclose(matrix[:, 2], np.median(moved - points, axis=0), atol=1e-4)
 
     def test_track_rois_between_frames_template_fallback_handles_large_translation(self):
         prev_gray = np.zeros((130, 150), dtype=np.uint8)
@@ -592,182 +721,65 @@ class RoiTrackingTest(unittest.TestCase):
         self.assertEqual(corrected_payload["rois"][0], predicted_payload["rois"][0])
         self.assertEqual(updates[0]["update_status"], "detection-failed")
 
-    def test_apply_tracked_fallback_translates_previous_result_when_detection_failed(self):
-        previous_result = {
-            "roi_idx": 2,
-            "status": "ok",
-            "confidence": "high",
-            "vertices": [[10, 10], [40, 10], [40, 50], [10, 50]],
-            "left_boundary": [[14, 15], [14, 45]],
-            "right_boundary": [[30, 15], [30, 45]],
-            "centerline": [[22, 15], [22, 45]],
-        }
-        failed_result = {
-            "roi_idx": 2,
-            "status": "failed",
-            "confidence": "failed",
-            "failure_reason": "no valid pair of long side edges",
-            "vertices": [[15, 13], [45, 13], [45, 53], [15, 53]],
-            "left_boundary": [],
-            "right_boundary": [],
-            "centerline": [],
-        }
-        previous_payload = {"rois": [{"roi_idx": 2, "vertices": previous_result["vertices"]}]}
-        predicted_payload = {"rois": [{"roi_idx": 2, "vertices": failed_result["vertices"]}]}
-        tracking = [{"roi_idx": 2, "status": "ok"}]
+    def test_visibility_requires_two_consistent_walls_after_loss(self):
+        roi = {"roi_idx": 7, "vertices": [[1, 1], [99, 1], [99, 99], [1, 99]]}
+        payload = {"rois": [roi]}
+        history = {}
 
-        results = tracker.apply_tracked_fallbacks(
-            [failed_result],
-            {2: previous_result},
-            previous_payload,
-            predicted_payload,
-            tracking,
-        )
+        def measure(x=40, width=20, **changes):
+            result = {**roi, "status": "ok", "confidence": "high", "wall_pair_coverage": .8,
+                      "tube_width_px": width, "centerline": [[x, 10], [x, 90]],
+                      "left_boundary": [[x-width/2, 10], [x-width/2, 90]],
+                      "right_boundary": [[x+width/2, 10], [x+width/2, 90]], **changes}
+            return tracker.assess_visibility([result], history, payload, payload, 7)[0]
 
-        fallback = results[0]
-        self.assertEqual(fallback["status"], "ok")
-        self.assertEqual(fallback["confidence"], "tracked")
-        self.assertEqual(fallback["fallback_reason"], "no valid pair of long side edges")
-        self.assertEqual(fallback["centerline"], [[27.0, 18.0], [27.0, 48.0]])
+        self.assertEqual(measure()["status"], "ok")
+        for changes in ({"wall_pair_coverage": .05}, {}, {"confidence": "low"}, {},
+                        {"x": 60}, {"x": 60, "width": 10}):
+            result = measure(**changes)
+            self.assertEqual(result["status"], "lost")
+            for key, _ in tracker.dmt.TUBE_LINES:
+                self.assertEqual(result[key], [])
+        recovered = measure(x=61, width=10)
+        self.assertEqual(recovered["centerline"], [[61, 10], [61, 90]])
+        output = [recovered]
+        tracker.reject_invalid_updates(output, [{"roi_idx": 7, "update_status": "rejected-anchor-drift"}], history)
+        self.assertEqual(output[0]["status"], "lost")
+        self.assertEqual(output[0]["failure_reason"], "rejected-anchor-drift")
+        self.assertEqual(measure()["status"], "lost")
 
-    def test_apply_tracked_fallback_allows_stationary_carry_when_tracking_failed(self):
-        previous_result = {
-            "roi_idx": 2,
-            "status": "ok",
-            "confidence": "low",
-            "vertices": [[10, 10], [40, 10], [40, 50], [10, 50]],
-            "left_boundary": [[14, 15], [14, 45]],
-            "right_boundary": [[30, 15], [30, 45]],
-            "centerline": [[22, 15], [22, 45]],
-        }
-        failed_result = {
-            "roi_idx": 2,
-            "status": "failed",
-            "confidence": "failed",
-            "failure_reason": "no valid pair of long side edges",
-            "vertices": previous_result["vertices"],
-            "left_boundary": [],
-            "right_boundary": [],
-            "centerline": [],
-        }
-        roi_payload = {"rois": [{"roi_idx": 2, "vertices": previous_result["vertices"]}]}
-        tracking = [{"roi_idx": 2, "status": "failed"}]
-
-        results = tracker.apply_tracked_fallbacks(
-            [failed_result],
-            {2: previous_result},
-            roi_payload,
-            roi_payload,
-            tracking,
-        )
-
-        self.assertEqual(results[0]["status"], "ok")
-        self.assertEqual(results[0]["confidence"], "tracked")
-        self.assertEqual(results[0]["centerline"], previous_result["centerline"])
-
-    def test_apply_update_rejection_fallback_replaces_false_detection_centerline(self):
-        previous_result = {
-            "roi_idx": 2,
-            "status": "ok",
-            "confidence": "high",
-            "vertices": [[0, 0], [100, 0], [100, 20], [0, 20]],
-            "left_boundary": [[10, 8], [90, 8]],
-            "right_boundary": [[10, 12], [90, 12]],
-            "centerline": [[10, 10], [90, 10]],
-        }
-        false_result = {
-            "roi_idx": 2,
-            "status": "ok",
-            "confidence": "high",
-            "vertices": [[140, 0], [240, 0], [240, 20], [140, 20]],
-            "left_boundary": [[150, 8], [230, 8]],
-            "right_boundary": [[150, 12], [230, 12]],
-            "centerline": [[150, 10], [230, 10]],
-        }
-        previous_payload = {"rois": [{"roi_idx": 2, "vertices": previous_result["vertices"]}]}
-        corrected_payload = {"rois": [{"roi_idx": 2, "vertices": previous_result["vertices"]}]}
-        updates = [{"roi_idx": 2, "update_status": "rejected-anchor-drift"}]
-
-        results = tracker.apply_update_rejection_fallbacks(
-            [false_result],
-            updates,
-            {2: previous_result},
-            previous_payload,
-            corrected_payload,
-        )
-
-        self.assertEqual(results[0]["status"], "ok")
-        self.assertEqual(results[0]["confidence"], "tracked")
-        self.assertEqual(results[0]["fallback_reason"], "rejected-anchor-drift")
-        self.assertEqual(results[0]["centerline"], previous_result["centerline"])
-
-    def test_apply_update_rejection_fallback_handles_exposure_shrink_rejection(self):
-        previous_result = {
-            "roi_idx": 5,
-            "status": "ok",
-            "confidence": "high",
-            "vertices": [[0, 0], [100, 0], [100, 40], [0, 40]],
-            "left_boundary": [[10, 5], [90, 5]],
-            "right_boundary": [[10, 35], [90, 35]],
-            "centerline": [[10, 20], [90, 20]],
-        }
-        false_result = {
-            "roi_idx": 5,
-            "status": "ok",
-            "confidence": "high",
-            "vertices": [[5, 5], [105, 5], [105, 25], [5, 25]],
-            "left_boundary": [[10, 8], [90, 8]],
-            "right_boundary": [[10, 22], [90, 22]],
-            "centerline": [[10, 15], [90, 15]],
-        }
-        previous_payload = {"rois": [{"roi_idx": 5, "vertices": previous_result["vertices"]}]}
-        guarded_payload = {"rois": [{"roi_idx": 5, "vertices": [[0, 10], [100, 10], [100, 50], [0, 50]]}]}
-        updates = [{"roi_idx": 5, "update_status": "rejected-exposure-shrink"}]
-
-        results = tracker.apply_update_rejection_fallbacks(
-            [false_result],
-            updates,
-            {5: previous_result},
-            previous_payload,
-            guarded_payload,
-        )
-
-        self.assertEqual(results[0]["confidence"], "tracked")
-        self.assertEqual(results[0]["fallback_reason"], "rejected-exposure-shrink")
-        self.assertEqual(results[0]["centerline"], [[10.0, 30.0], [90.0, 30.0]])
-
-    def test_guard_centerline_lateral_jumps_clamps_output_centerline(self):
-        previous_result = {
-            "roi_idx": 2,
-            "status": "ok",
-            "confidence": "high",
-            "centerline": [[10, 20], [10, 80]],
-        }
-        current_result = {
-            "roi_idx": 2,
-            "status": "ok",
-            "confidence": "high",
-            "centerline": [[25, 20], [25, 80]],
-            "centerline_source": "foreground-body",
-        }
-        roi_payload = {
-            "rois": [
-                {"roi_idx": 2, "vertices": [[0, 0], [40, 0], [40, 100], [0, 100]]},
-            ]
-        }
-
-        results = tracker.guard_centerline_lateral_jumps(
-            [current_result],
-            {2: previous_result},
-            roi_payload,
-            roi_payload,
-            max_lateral_jump=7.0,
-        )
-
-        self.assertEqual(results[0]["centerline"], [[10.0, 20.0], [10.0, 80.0]])
-        self.assertEqual(results[0]["centerline_source"], "temporal-propagated")
-        self.assertEqual(results[0]["centerline_original_source"], "foreground-body")
-        self.assertEqual(results[0]["centerline_guard_status"], "temporal-lateral-clamped")
+    def test_occluded_tube_shows_no_lines_until_two_visible_frames(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            roi = {"roi_idx": 4, "vertices": [[30, 10], [90, 10], [90, 150], [30, 150]]}
+            rois = root / "rois.json"
+            rois.write_text(json.dumps({"rois": [roi]}))
+            images = []
+            for i, visible in enumerate([True, False, True, False, True, True]):
+                gray = np.full((160, 120), 225, np.uint8)
+                gray[:, 45:75 if visible else 120] = 50
+                path = root / f"{i}.png"
+                tracker.dmt.write_image_unicode(path, gray)
+                images.append(str(path))
+            args = tracker.parse_args(["--images", *images, "--initial-rois", str(rois),
+                                       "--roi-update-mode", "flow", "--out-dir", str(root), "--video-scale", "1", "--no-window"])
+            payload = tracker.run_sequence(args)
+            items = [frame["centerlines"][0] for frame in payload["frames"]]
+            self.assertEqual([item["status"] for item in items], ["ok", "lost", "lost", "lost", "lost", "ok"])
+            self.assertTrue(all(item["centerline"] is None for item in items[1:-1]))
+            for video in [args._resolved_roi_video, args._resolved_out_video]:
+                cap = cv2.VideoCapture(str(video))
+                try:
+                    for item in items:
+                        ok, frame = cap.read()
+                        self.assertTrue(ok)
+                        # The middle scanline excludes the header, ROI ID and LOST badge.
+                        b, g, r = frame[len(frame)//2].astype(int).T
+                        for color in [(b > 145) & (g > 125) & (r < 100),
+                                      (r > 145) & (g > 145) & (b < 100)]:
+                            self.assertEqual(bool(color.any()), item["status"] == "ok")
+                finally:
+                    cap.release()
 
     def test_guard_long_span_collapsed_rois_rejects_skinny_history_collapse(self):
         predicted_payload = {
@@ -797,100 +809,6 @@ class RoiTrackingTest(unittest.TestCase):
         self.assertEqual(guarded_updates[0]["update_status"], "rejected-long-span-history-shrink")
         self.assertLess(guarded_updates[0]["roi_long_span_ratio"], 0.60)
 
-    def test_apply_group_vertical_motion_prior_nudges_stuck_roi_downward(self):
-        anchor_payload = {
-            "rois": [
-                {"roi_idx": 1, "vertices": [[0, 0], [20, 0], [20, 40], [0, 40]]},
-                {"roi_idx": 2, "vertices": [[40, 0], [60, 0], [60, 40], [40, 40]]},
-                {"roi_idx": 3, "vertices": [[80, 0], [100, 0], [100, 40], [80, 40]]},
-            ]
-        }
-        current_payload = {
-            "rois": [
-                {"roi_idx": 1, "vertices": [[0, 8], [20, 8], [20, 48], [0, 48]]},
-                {"roi_idx": 2, "vertices": [[40, 60], [60, 60], [60, 100], [40, 100]]},
-                {"roi_idx": 3, "vertices": [[80, 70], [100, 70], [100, 110], [80, 110]]},
-            ]
-        }
-
-        adjusted, updates = tracker.apply_group_vertical_motion_prior(
-            current_payload,
-            anchor_payload,
-            min_group_drift=20.0,
-            floor_frac=0.80,
-            tolerance=4.0,
-            max_adjustment=500.0,
-        )
-
-        adjusted_by_idx = {roi["roi_idx"]: roi for roi in adjusted["rois"]}
-        stuck_center_y = tracker._roi_center(adjusted_by_idx[1])[1]
-        self.assertAlmostEqual(float(stuck_center_y), 68.0, places=1)
-        self.assertEqual(len(updates), 1)
-        self.assertEqual(updates[0]["roi_idx"], 1)
-        self.assertEqual(updates[0]["motion_prior_status"], "group-vertical-adjusted")
-        self.assertAlmostEqual(updates[0]["motion_prior_shift_y"], 40.0, places=1)
-
-    def test_apply_group_vertical_motion_prior_restores_reverse_drift(self):
-        anchor_payload = {
-            "rois": [
-                {"roi_idx": 1, "vertices": [[0, 0], [20, 0], [20, 40], [0, 40]]},
-                {"roi_idx": 2, "vertices": [[40, 0], [60, 0], [60, 40], [40, 40]]},
-                {"roi_idx": 3, "vertices": [[80, 0], [100, 0], [100, 40], [80, 40]]},
-            ]
-        }
-        history_payload = {
-            "rois": [
-                {"roi_idx": 1, "vertices": [[0, 100], [20, 100], [20, 140], [0, 140]]},
-            ]
-        }
-        current_payload = {
-            "rois": [
-                {"roi_idx": 1, "vertices": [[0, 60], [20, 60], [20, 100], [0, 100]]},
-                {"roi_idx": 2, "vertices": [[40, 90], [60, 90], [60, 130], [40, 130]]},
-                {"roi_idx": 3, "vertices": [[80, 95], [100, 95], [100, 135], [80, 135]]},
-            ]
-        }
-
-        adjusted, updates = tracker.apply_group_vertical_motion_prior(
-            current_payload,
-            anchor_payload,
-            history_payload=history_payload,
-            min_group_drift=20.0,
-            floor_frac=0.80,
-            tolerance=4.0,
-            history_tolerance=2.0,
-            max_adjustment=500.0,
-        )
-
-        adjusted_by_idx = {roi["roi_idx"]: roi for roi in adjusted["rois"]}
-        restored_center_y = tracker._roi_center(adjusted_by_idx[1])[1]
-        self.assertAlmostEqual(float(restored_center_y), 118.0, places=1)
-        self.assertEqual(len(updates), 1)
-        self.assertEqual(updates[0]["roi_idx"], 1)
-        self.assertIn("history-floor", updates[0]["motion_prior_reasons"])
-
-    def test_update_vertical_motion_history_keeps_lowest_roi_center(self):
-        history_payload = {
-            "rois": [
-                {"roi_idx": 1, "vertices": [[0, 100], [20, 100], [20, 140], [0, 140]]},
-                {"roi_idx": 2, "vertices": [[40, 40], [60, 40], [60, 80], [40, 80]]},
-            ]
-        }
-        current_payload = {
-            "rois": [
-                {"roi_idx": 1, "vertices": [[0, 80], [20, 80], [20, 120], [0, 120]]},
-                {"roi_idx": 2, "vertices": [[40, 90], [60, 90], [60, 130], [40, 130]]},
-            ]
-        }
-
-        updated = tracker.update_vertical_motion_history(history_payload, current_payload)
-
-        updated_by_idx = {roi["roi_idx"]: roi for roi in updated["rois"]}
-        self.assertAlmostEqual(float(tracker._roi_center(updated_by_idx[1])[1]), 120.0, places=1)
-        self.assertAlmostEqual(float(tracker._roi_center(updated_by_idx[2])[1]), 110.0, places=1)
-
-
-class SequenceCliTest(unittest.TestCase):
     def test_parse_args_accepts_sequence_inputs(self):
         args = tracker.parse_args(
             [
@@ -921,11 +839,6 @@ class SequenceCliTest(unittest.TestCase):
         self.assertEqual(args.history_long_span_drop, 80.0)
         self.assertEqual(args.history_short_span_ratio, 0.85)
         self.assertEqual(args.max_anchor_drift, 0.0)
-        self.assertEqual(args.vertical_motion_prior, "group")
-        self.assertEqual(args.vertical_motion_min_drift, 15.0)
-        self.assertEqual(args.vertical_motion_floor_frac, 0.85)
-        self.assertEqual(args.vertical_motion_tolerance, 4.0)
-        self.assertEqual(args.vertical_motion_history_tolerance, 2.0)
         self.assertEqual(args.exposure_guard, "shrink")
         self.assertEqual(args.exposure_mean_jump, 25.0)
         self.assertEqual(args.exposure_saturation_jump, 0.15)
@@ -937,7 +850,7 @@ class SequenceCliTest(unittest.TestCase):
         self.assertEqual(args.exposure_min_shrunk_rois, 2)
         self.assertEqual(args.lk_window_size, 31)
         self.assertEqual(args.lk_max_level, 4)
-        self.assertEqual(args.track_group_outlier_min_dy, 55.0)
+        self.assertEqual(args.track_group_outlier_min_dy, 0.0)
         self.assertEqual(args.track_group_outlier_dy_deviation, 45.0)
         self.assertTrue(args.centerline_foreground_correction)
         self.assertEqual(args.centerline_lateral_jump, 7.0)
@@ -1210,6 +1123,8 @@ class SequenceRoiUpdateTest(unittest.TestCase):
                 "roi_idx": 1,
                 "status": "ok",
                 "confidence": "high",
+                "tube_width_px": 20,
+                "wall_pair_coverage": .9,
                 "vertices": [[0, 0], [100, 0], [100, 100], [0, 100]],
                 "left_boundary": [[40, 20], [40, 80]],
                 "right_boundary": [[60, 20], [60, 80]],

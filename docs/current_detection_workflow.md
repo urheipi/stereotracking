@@ -24,7 +24,7 @@
 - `track_main_tube_sequence.py`：图像序列处理，负责 ROI 跟踪、调用单帧检测、输出每帧中心线。
 - `scripts/run_tracking.ps1`：当前常用运行入口。
 - `tracking_results/drawn_rois.json`：首帧 ROI。
-- `tracking_results/sequence_centerlines.json`：序列中心线结果。
+- `tracking_results/runs/<启动时间>/sequence_centerlines_*.json`：序列中心线结果。
 
 ## 整体流程
 
@@ -38,7 +38,7 @@ flowchart TD
     F --> G["在预测 ROI 内运行单帧检测"]
     G --> H{"检测是否可信"}
     H -->|是| I["用检测到的左右边界重建/校正 ROI"]
-    H -->|否| J["尝试使用上一帧结果平移兜底"]
+    H -->|否| J["标记 LOST，保留搜索框"]
     I --> K["记录中心线和跟踪信息"]
     J --> K
     K --> L{"还有下一帧?"}
@@ -273,7 +273,7 @@ results, _ = dmt.detect_all(next_gray, predicted_roi_payload, config)
 --exposure-guard shrink
 ```
 
-当检测到均值亮度跳变、饱和像素比例上升，或者多个 ROI 同时异常缩窄时，程序会拒绝这类 ROI 收缩更新，保留预测 ROI 或上一帧传播结果。
+当检测到均值亮度跳变、饱和像素比例上升，或者多个 ROI 同时异常缩窄时，程序会拒绝这类 ROI 收缩更新，保留预测 ROI 用于下一帧搜索。
 
 被拒绝时，跟踪信息里可能出现：
 
@@ -283,35 +283,13 @@ results, _ = dmt.detect_all(next_gray, predicted_roi_payload, config)
 }
 ```
 
-### 6. 检测失败时的兜底
+### 6. 管壁可见性与丢失
 
-代码位置：
+`assess_visibility()` 逐帧检查当前测量。较弱管壁的边缘强度和连续性须达到 `medium` 或 `high`。此外，沿拟合的两条管壁横向取样，在至少 20% 的截面上，两侧都须出现超过局部噪声的亮度变化，方向与同一根亮管或暗管相符。细线横穿管道时，其余截面仍可提供证据。
 
-- `apply_tracked_fallbacks()`
-- `apply_update_rejection_fallbacks()`
+连续帧的管宽比须在 2/3 到 1.5 之间。扣除搜索框位移后，中心线横向偏差默认上限为 7 像素。如果管壁证据不足、测量突跳，或 ROI 几何校正被拒，该帧立即标记 `lost`。丢失期间继续搜索，连续两帧测得相符的管壁且通过校验后恢复输出。
 
-如果当前帧单帧检测失败，但 ROI 跟踪本身是可信的，程序会把上一帧可信的边界和中心线按 ROI 中心位移平移过来。
-
-这类结果会标记为：
-
-```json
-{
-  "status": "ok",
-  "confidence": "tracked"
-}
-```
-
-含义是：当前帧没有重新检测到可靠边界，而是用跟踪传播出的结果兜底。
-
-## 置信度含义
-
-检测结果里常见的 `confidence`：
-
-- `high`：边界连续性好、边缘对比明显、宽度比例合理。
-- `medium`：边界基本成立，可以用于默认 ROI 校正。
-- `low`：找到了候选边界，但质量偏弱；默认不会用于 ROI 校正。
-- `failed`：没有找到有效边界对。
-- `tracked`：不是当前帧真实检测结果，而是上一帧结果通过跟踪平移得到的兜底结果。
+实时预览、全局视频和局部视频都以青线表示两侧管壁，以黄线表示中心线。丢失帧显示红底 `LOST` 标记，JSON 中 `centerline` 为 `null`，`failure_reason` 记录原因。
 
 ## 主要输出字段
 
@@ -361,34 +339,19 @@ A*x + B*y + C = 0
 
 ## 当前常用运行方式
 
-当前包装脚本：
+双击 `run_testbmp_live.cmd` 处理 `testbmp`，或在项目根目录打开 PowerShell 指定图片目录。
 
 ```powershell
-.\scripts\run_tracking.ps1
+.\run_testbmp_live.cmd -ImageDir "D:\采集数据\第二组"
 ```
 
-等价于大致运行：
-
-```powershell
-python track_main_tube_sequence.py `
-  --image-dir trackingbmp `
-  --pattern "*.bmp" `
-  --sort-by timestamp `
-  --initial-rois tracking_results\drawn_rois.json `
-  --out-dir tracking_results `
-  --no-window `
-  --review-mode continuous `
-  --pause-on none `
-  --progress-every 10 `
-  --track-scale 1
-```
+在首帧框选管道后按 Enter 开始。录像和逐帧结果保存在 `tracking_results/runs/<启动时间>/`。
 
 未在脚本中显式指定的关键默认值包括：
 
 ```text
 --roi-update-mode detect-corrected
 --min-roi-update-confidence medium
---vertical-motion-prior group
 --exposure-guard shrink
 --min-width-frac 0.28
 --max-width-frac 0.92
@@ -397,11 +360,7 @@ python track_main_tube_sequence.py `
 
 ## 怎么判断一帧是不是“真实检测”
 
-看 `confidence`：
-
-- `high`、`medium`、`low`：当前帧确实运行了边界检测，并找到了候选边界。
-- `tracked`：当前帧使用了上一帧结果平移兜底，不代表当前帧真实检测到了边界。
-- `failed`：当前 ROI 检测失败。
+序列结果的 `status` 为 `ok` 时，中心线来自当前帧的可信管壁。`status` 为 `lost` 时该帧没有可发布的中心线。`wall_pair_coverage` 是候选两侧管壁在相同截面上同时获得亮度支持的比例，从 0 到 1。
 
 看 `tracking.update_status`：
 
@@ -418,7 +377,7 @@ python track_main_tube_sequence.py `
 - 首帧 ROI 需要大致框住目标。
 - ROI 内最好只有一个主要管体目标。
 - 管壁在拉正图里要能形成较连续的左右边缘。
-- 如果强反光、过曝、遮挡或背景边缘很强，检测可能退化为低置信、失败或 `tracked` 兜底。
+- 如果强反光、过曝、遮挡或背景边缘很强，两侧管壁可能无法确认，序列会显示 `LOST`。
 
 它的优点是无需训练数据、结果可解释、调试图能直接看到边界证据；限制是对 ROI 质量、边缘可见性和曝光稳定性比较敏感。
 

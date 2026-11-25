@@ -21,9 +21,10 @@ import numpy as np
 MAX_RECTIFIED_DIM = 32000
 MAX_RECTIFIED_PIXELS = 40_000_000
 MIN_EDGE_PAIR_SEPARATION_PX = 8
-LEFT_BOUNDARY_COLOR = (0, 0, 255)
-RIGHT_BOUNDARY_COLOR = (0, 255, 0)
+WALL_COLOR = (255, 210, 0)
 CENTERLINE_COLOR = (0, 255, 255)
+TUBE_LINES = (("left_boundary", WALL_COLOR), ("right_boundary", WALL_COLOR),
+              ("centerline", CENTERLINE_COLOR))
 
 
 @dataclass
@@ -474,7 +475,7 @@ def _boundary_support(evidence: np.ndarray, mask: np.ndarray, x: int, threshold:
     valid_rows = mask_band.max(axis=1)
     if not np.any(valid_rows):
         return 0.0
-    supported_rows = (edge_band.max(axis=1) > threshold) & valid_rows
+    supported_rows = ((edge_band > threshold) & mask_band).any(axis=1)
     return float(supported_rows.sum() / valid_rows.sum())
 
 
@@ -607,16 +608,48 @@ def _refine_pair_with_foreground_span(
     return refined
 
 
+def _wall_contrast(crop: np.ndarray, mask: np.ndarray, xs: int | np.ndarray, step: int) -> np.ndarray:
+    """Signed cross-wall intensity step. A wire narrower than the sampling band cancels out."""
+    rows = np.arange(crop.shape[0])
+    xs = np.broadcast_to(np.rint(xs).astype(int), rows.shape)
+    lo = np.clip(xs - step, 0, crop.shape[1] - 1)
+    hi = np.clip(xs + step, 0, crop.shape[1] - 1)
+    delta = crop[rows, hi].astype(np.int16) - crop[rows, lo]
+    in_bounds = (xs >= 0) & (xs < crop.shape[1])
+    in_roi = mask[rows, np.clip(xs, 0, crop.shape[1] - 1)] > 0
+    return np.where(in_bounds & in_roi, delta, 0)
+
+
+def _paired_wall_support(left: np.ndarray, right: np.ndarray, threshold: float = 12) -> float:
+    dark_tube = (left < -threshold) & (right > threshold)
+    light_tube = (left > threshold) & (right < -threshold)
+    return max(np.count_nonzero(dark_tube), np.count_nonzero(light_tube)) / len(left)
+
+
 def find_edge_pair(crop: np.ndarray, mask: np.ndarray, config: DetectionConfig) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
     height, width = crop.shape
     evidence, profile = _edge_evidence(crop, mask, config)
     peaks = _find_profile_peaks(profile, config.max_profile_peaks)
 
     valid_evidence = evidence[mask > 0]
-    threshold = float(np.percentile(valid_evidence, 78)) if valid_evidence.size else 0.0
+    threshold = max(2.0, float(np.percentile(valid_evidence, 78))) if valid_evidence.size else 2.0
     min_sep = max(MIN_EDGE_PAIR_SEPARATION_PX, int(config.min_width_frac * width))
     max_sep = max(min_sep + 4, int(config.max_width_frac * width))
 
+    support = {x: _boundary_support(evidence, mask, x, threshold) for _, x in peaks}
+    step = max(3, min(12, int(round(width * 0.08))))
+    contrast = {x: _wall_contrast(crop, mask, x, step) for _, x in peaks}
+    # Estimate the noise in this crop. Each wall must show a repeatable step
+    # above it, even if the other wall casts a very strong edge.
+    residual = cv2.absdiff(crop, cv2.medianBlur(crop, 3))[mask > 0]
+    noise_floor = max(2.0, 4.0 * float(np.median(residual))) if residual.size else 2.0
+    def has_wall(delta: np.ndarray) -> bool:
+        return max(np.count_nonzero(delta > noise_floor),
+                   np.count_nonzero(delta < -noise_floor)) >= 0.15 * height
+
+    peaks = [(value, x) for value, x in peaks if has_wall(contrast[x]) and support[x] >= 0.15]
+    positive_profile = profile[profile > 0]
+    background_strength = max(1.0, float(np.median(positive_profile))) if positive_profile.size else 1.0
     best: dict[str, Any] | None = None
     for i, (left_strength_raw, a) in enumerate(peaks):
         for right_strength_raw, b in peaks[i + 1 :]:
@@ -625,8 +658,8 @@ def find_edge_pair(crop: np.ndarray, mask: np.ndarray, config: DetectionConfig) 
             if tube_width < min_sep or tube_width > max_sep:
                 continue
 
-            left_support = _boundary_support(evidence, mask, left_x, threshold)
-            right_support = _boundary_support(evidence, mask, right_x, threshold)
+            left_support = support[left_x]
+            right_support = support[right_x]
             continuity = 0.5 * (left_support + right_support)
 
             width_frac = tube_width / max(1, width)
@@ -637,13 +670,8 @@ def find_edge_pair(crop: np.ndarray, mask: np.ndarray, config: DetectionConfig) 
             else:
                 width_prior = 1.0
 
-            positive_profile = profile[profile > 0]
-            edge_contrast = (
-                (left_strength_raw + right_strength_raw) / (float(np.median(positive_profile)) + 1e-6)
-                if positive_profile.size
-                else 0.0
-            )
             score = (left_strength_raw + right_strength_raw) * (0.4 + continuity) * width_prior
+            score *= 0.5 + _paired_wall_support(contrast[left_x], contrast[right_x])
 
             candidate = {
                 "score": float(score),
@@ -651,10 +679,9 @@ def find_edge_pair(crop: np.ndarray, mask: np.ndarray, config: DetectionConfig) 
                 "right_x": int(right_x),
                 "tube_width_px": int(tube_width),
                 "tube_width_frac": float(width_frac),
-                "left_strength": float(left_strength_raw),
-                "right_strength": float(right_strength_raw),
+                "left_strength": float(profile[left_x]),
+                "right_strength": float(profile[right_x]),
                 "continuity": float(continuity),
-                "edge_contrast": float(edge_contrast),
             }
             if best is None or candidate["score"] > best["score"]:
                 best = candidate
@@ -669,7 +696,14 @@ def find_edge_pair(crop: np.ndarray, mask: np.ndarray, config: DetectionConfig) 
             "failure_reason": "no valid pair of long side edges",
         }, profile, evidence
 
-    best = _refine_pair_with_foreground_span(best, peaks, profile, crop, mask, config)
+    refined = _refine_pair_with_foreground_span(best, peaks, profile, crop, mask, config)
+    supported_peaks = {x for _, x in peaks}
+    if refined["left_x"] in supported_peaks and refined["right_x"] in supported_peaks:
+        best = refined
+    # Confidence describes the pair. A single strong peak in blank sky must
+    # not compensate for a missing second boundary.
+    best["continuity"] = min(support[best["left_x"]], support[best["right_x"]])
+    best["edge_contrast"] = min(best["left_strength"], best["right_strength"]) / background_strength
 
     if (
         best["continuity"] >= 0.45
@@ -683,6 +717,7 @@ def find_edge_pair(crop: np.ndarray, mask: np.ndarray, config: DetectionConfig) 
         confidence = "low"
 
     best["status"] = "ok"
+    best["wall_noise_floor"] = noise_floor
     best["confidence"] = confidence
     best["candidate_peaks"] = peak_debug
     return best, profile, evidence
@@ -701,44 +736,35 @@ def _fit_one_boundary_line(
     min_strength: float,
 ) -> BoundaryLineModel | None:
     height, width = evidence.shape
-    samples: list[tuple[float, float, float]] = []
     expected_x = int(np.clip(expected_x, 0, width - 1))
-
-    for y in range(height):
-        x0 = max(0, expected_x - search_radius)
-        x1 = min(width, expected_x + search_radius + 1)
-        if x1 <= x0:
-            continue
-
-        row_mask = mask[y, x0:x1] > 0
-        if not np.any(row_mask):
-            continue
-
-        row_values = evidence[y, x0:x1].copy()
-        row_values[~row_mask] = 0.0
-        xs = np.arange(x0, x1, dtype=np.float32)
-        sigma = max(2.0, search_radius / 2.0)
-        spatial_weight = np.exp(-0.5 * ((xs - float(expected_x)) / sigma) ** 2)
-        local_idx = int(np.argmax(row_values * spatial_weight))
-        strength = float(row_values[local_idx])
-        if strength <= min_strength:
-            continue
-
-        samples.append((float(y), float(x0 + local_idx), strength))
-
+    x0 = max(0, expected_x - search_radius)
+    x1 = min(width, expected_x + search_radius + 1)
+    columns = np.arange(x0, x1, dtype=np.float32)
+    weights_x = np.exp(-0.5 * ((columns - expected_x) / max(2.0, search_radius / 2.0)) ** 2)
+    band = np.where(mask[:, x0:x1], evidence[:, x0:x1], 0)
+    peaks = np.argmax(band * weights_x, axis=1)
+    strengths = band[np.arange(height), peaks]
+    ys = np.flatnonzero(strengths > min_strength)
     min_samples = max(8, int(round(height * 0.18)))
-    if len(samples) < min_samples:
+    if ys.size < min_samples:
         return None
-
-    ys = np.asarray([sample[0] for sample in samples], dtype=np.float32)
-    xs = np.asarray([sample[1] for sample in samples], dtype=np.float32)
-    weights = np.sqrt(np.asarray([sample[2] for sample in samples], dtype=np.float32) + 1e-6)
+    xs = columns[peaks[ys]]
+    weights = np.sqrt(strengths[ys] + 1e-6)
     if float(np.ptp(ys)) < 4.0:
         return None
 
     slope, intercept = np.polyfit(ys, xs, 1, w=weights)
     predicted = slope * ys + intercept
     residual = np.abs(xs - predicted)
+    # A wire crossing the tube can dominate a few rows. Refit the wall
+    # using the rows consistent with its long straight edge.
+    inliers = residual <= max(2.0, 3.0 * float(np.median(residual)))
+    if min_samples <= np.count_nonzero(inliers) < ys.size:
+        ys, xs, weights = ys[inliers], xs[inliers], weights[inliers]
+        if np.ptp(ys) < 4:
+            return None
+        slope, intercept = np.polyfit(ys, xs, 1, w=weights)
+        residual = np.abs(xs - (slope * ys + intercept))
     median_residual = float(np.median(residual))
     mid_y = (height - 1) / 2.0
     if abs(float(slope * mid_y + intercept) - float(expected_x)) > max(4.0, search_radius * 0.55):
@@ -749,7 +775,7 @@ def _fit_one_boundary_line(
     return BoundaryLineModel(
         slope=float(slope),
         intercept=float(intercept),
-        support_rows=len(samples),
+        support_rows=int(ys.size),
         median_residual=median_residual,
         support_y_min=float(ys.min()),
         support_y_max=float(ys.max()),
@@ -808,13 +834,6 @@ def _line_x(model: BoundaryLineModel | None, fallback_x: float, y: float, width:
     return float(np.clip(x, 0.0, max(0.0, float(width - 1))))
 
 
-def _band_has_mask(mask: np.ndarray, y: int, x: float) -> bool:
-    width = mask.shape[1]
-    center_x = int(round(x))
-    band = mask[y, max(0, center_x - 2) : min(width, center_x + 3)]
-    return bool(band.max(initial=0) > 0)
-
-
 def _sample_boundaries(
     meta: RectifyMeta,
     mask: np.ndarray,
@@ -836,62 +855,32 @@ def _sample_boundaries(
             y1 = min(meta.height - 1, int(np.ceil(support_max)))
             rows = np.arange(y0, y1 + 1, dtype=np.int32)
 
-    valid_rows: list[int] = []
-    for y in rows:
-        y_float = float(y)
-        left_row_x = _line_x(left_model, float(left_x), y_float, meta.width)
-        right_row_x = _line_x(right_model, float(right_x), y_float, meta.width)
-        center_row_x = (left_row_x + right_row_x) / 2.0
-        if (
-            _band_has_mask(mask, int(y), left_row_x)
-            or _band_has_mask(mask, int(y), right_row_x)
-            or _band_has_mask(mask, int(y), center_row_x)
-        ):
-            valid_rows.append(int(y))
+    def columns(y: np.ndarray, model: BoundaryLineModel | None, fallback: float) -> np.ndarray:
+        values = model.slope * y + model.intercept if model else np.full(y.shape, fallback)
+        return np.clip(values, 0, meta.width - 1)
 
-    if not valid_rows:
-        valid_rows = [0, meta.height - 1]
+    left_cols = columns(rows, left_model, left_x)
+    right_cols = columns(rows, right_model, right_x)
+    mask_band = cv2.dilate(mask, np.ones((1, 5), dtype=np.uint8))
+    valid = np.zeros(rows.size, dtype=bool)
+    for col in (left_cols, right_cols, (left_cols + right_cols) / 2):
+        valid |= mask_band[rows, np.rint(col).astype(int)] > 0
+    valid_rows = rows[valid]
+    if not valid_rows.size:
+        valid_rows = np.array([0, meta.height - 1])
+    sample_rows = (np.linspace(valid_rows[0], valid_rows[-1], count)
+                   if valid_rows.size > count else valid_rows)
+    left_cols = columns(sample_rows, left_model, left_x)
+    right_cols = columns(sample_rows, right_model, right_x)
+    middle = (left_cols + right_cols) / 2 if left_model and right_model else fallback_center_x
+    center_cols = np.clip(middle + center_offset_x, np.minimum(left_cols, right_cols), np.maximum(left_cols, right_cols))
+    origins = meta.center + (sample_rows[:, None] + meta.long_min) * meta.long_axis
 
-    if len(valid_rows) > count:
-        sample_rows = np.linspace(valid_rows[0], valid_rows[-1], count)
-    else:
-        sample_rows = np.asarray(valid_rows, dtype=np.float32)
+    def map_columns(col: np.ndarray) -> list[list[float]]:
+        points = origins + (col[:, None] + meta.short_min) * meta.short_axis
+        return np.round(points, 3).tolist()
 
-    left = [
-        map_rectified_point(meta, _line_x(left_model, float(left_x), float(y), meta.width), float(y))
-        for y in sample_rows
-    ]
-    right = [
-        map_rectified_point(meta, _line_x(right_model, float(right_x), float(y), meta.width), float(y))
-        for y in sample_rows
-    ]
-    center = [
-        map_rectified_point(
-            meta,
-            np.clip(
-                (
-                    (
-                        _line_x(left_model, float(left_x), float(y), meta.width)
-                        + _line_x(right_model, float(right_x), float(y), meta.width)
-                    )
-                    / 2.0
-                    if left_model is not None and right_model is not None
-                    else fallback_center_x
-                )
-                + float(center_offset_x),
-                min(
-                    _line_x(left_model, float(left_x), float(y), meta.width),
-                    _line_x(right_model, float(right_x), float(y), meta.width),
-                ),
-                max(
-                    _line_x(left_model, float(left_x), float(y), meta.width),
-                    _line_x(right_model, float(right_x), float(y), meta.width),
-                ),
-            ),
-            float(y),
-        )
-        for y in sample_rows
-    ]
+    left, right, center = (map_columns(col) for col in (left_cols, right_cols, center_cols))
     return left, right, center
 
 
@@ -901,8 +890,9 @@ def _foreground_centerline_offset(
     left_x: int,
     right_x: int,
     config: DetectionConfig,
-    left_model: BoundaryLineModel | None = None,
-    right_model: BoundaryLineModel | None = None,
+    left_model: BoundaryLineModel | None,
+    right_model: BoundaryLineModel | None,
+    paired_support: float,
 ) -> tuple[float, dict[str, Any] | None]:
     if not config.centerline_foreground_correction:
         return 0.0, None
@@ -911,6 +901,16 @@ def _foreground_centerline_offset(
 
     edge_width = float(int(right_x) - int(left_x))
     if edge_width <= MIN_EDGE_PAIR_SEPARATION_PX:
+        return 0.0, None
+
+    # Keep the geometric midpoint when both walls delimit the same body over
+    # most of its length. A shaded half of a round tube is not a second tube.
+    # In clutter one wall may change contrast polarity against the background.
+    # A shorter stretch of bilateral contrast suffices if both fitted lines
+    # also have accurate, long support over the rest of the tube.
+    stable_walls = all(model is not None and model.support_rows >= 0.65 * crop.shape[0]
+                       and model.median_residual <= 2 for model in (left_model, right_model))
+    if paired_support >= 0.50 or (stable_walls and paired_support >= 0.25):
         return 0.0, None
 
     foreground = _foreground_column_profile(crop, mask)
@@ -1143,6 +1143,13 @@ def detect_roi(gray: np.ndarray, roi: dict[str, Any], config: DetectionConfig | 
                 "support_rows": int(right_model.support_rows),
                 "median_residual": round(right_model.median_residual, 3),
             }
+        rows = np.arange(crop.shape[0])
+        step = max(3, min(12, round(pair["tube_width_px"] * 0.12)))
+        left_cols = left_model.slope * rows + left_model.intercept if left_model else pair["left_x"]
+        right_cols = right_model.slope * rows + right_model.intercept if right_model else pair["right_x"]
+        left_step = _wall_contrast(crop, mask, left_cols, step)
+        right_step = _wall_contrast(crop, mask, right_cols, step)
+        result["wall_pair_coverage"] = _paired_wall_support(left_step, right_step, pair["wall_noise_floor"])
         center_offset_x, centerline_info = _foreground_centerline_offset(
             crop,
             mask,
@@ -1151,6 +1158,7 @@ def detect_roi(gray: np.ndarray, roi: dict[str, Any], config: DetectionConfig | 
             config,
             left_model,
             right_model,
+            _paired_wall_support(left_step, right_step),
         )
         left, right, center = _sample_boundaries(
             meta,
@@ -1193,30 +1201,32 @@ def draw_overlay(gray: np.ndarray, results: list[dict[str, Any]]) -> np.ndarray:
         "failed": (0, 0, 255),
     }
 
+    line_width = max(2, round(min(gray.shape[:2]) / 1100))
     for result in results:
         vertices = np.asarray(result["vertices"], dtype=np.int32)
-        color = confidence_color.get(result["confidence"], (0, 0, 255))
-        cv2.polylines(overlay, [vertices], True, color, 2, cv2.LINE_AA)
+        lost = result["status"] == "lost"
+        color = (0, 0, 255) if lost else confidence_color.get(result["confidence"], (0, 0, 255))
+        cv2.polylines(overlay, [vertices], True, (145, 145, 145), 1, cv2.LINE_AA)
 
         if result["status"] == "ok":
-            for key, line_color in [
-                ("left_boundary", LEFT_BOUNDARY_COLOR),
-                ("right_boundary", RIGHT_BOUNDARY_COLOR),
-                ("centerline", CENTERLINE_COLOR),
-            ]:
+            for key, line_color in TUBE_LINES:
                 pts = np.asarray(result[key], dtype=np.float32).round().astype(np.int32)
                 if len(pts) >= 2:
-                    cv2.polylines(overlay, [pts], False, line_color, 2, cv2.LINE_AA)
+                    cv2.polylines(overlay, [pts], False, line_color, line_width, cv2.LINE_AA)
 
-        label_point = vertices.mean(axis=0).round().astype(int)
-        label = f"R{result['roi_idx']}:{result['confidence']}"
+        label = f"R{result['roi_idx']} {'LOST' if lost else result['confidence']}"
+        scale = max(0.5, min(gray.shape[:2]) / 1900)
+        (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+        x = int(np.clip(vertices[:, 0].min(), 0, max(0, gray.shape[1] - tw - 6)))
+        y = int(np.clip(vertices[:, 1].min() - 4, th + 4, max(th + 4, gray.shape[0] - baseline)))
+        cv2.rectangle(overlay, (x, y-th-3), (x+tw+5, y+baseline), (0, 0, 155) if lost else (25, 25, 25), -1)
         cv2.putText(
             overlay,
             label,
-            tuple(label_point),
+            (x + 2, y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            color,
+            scale,
+            (255, 255, 255) if lost else color,
             2,
             cv2.LINE_AA,
         )
@@ -1262,12 +1272,12 @@ def make_roi_debug_panel(result: dict[str, Any], debug: dict[str, Any]) -> np.nd
             right_bottom = line_x(right_line, height - 1)
             center_top = int(round((left_top + right_top) / 2.0))
             center_bottom = int(round((left_bottom + right_bottom) / 2.0))
-            cv2.line(panel, (left_top, 0), (left_bottom, height - 1), LEFT_BOUNDARY_COLOR, 2)
-            cv2.line(panel, (right_top, 0), (right_bottom, height - 1), RIGHT_BOUNDARY_COLOR, 2)
+            cv2.line(panel, (left_top, 0), (left_bottom, height - 1), WALL_COLOR, 2)
+            cv2.line(panel, (right_top, 0), (right_bottom, height - 1), WALL_COLOR, 2)
             cv2.line(panel, (center_top, 0), (center_bottom, height - 1), CENTERLINE_COLOR, 1)
         else:
-            cv2.line(panel, (left_x, 0), (left_x, height - 1), LEFT_BOUNDARY_COLOR, 2)
-            cv2.line(panel, (right_x, 0), (right_x, height - 1), RIGHT_BOUNDARY_COLOR, 2)
+            cv2.line(panel, (left_x, 0), (left_x, height - 1), WALL_COLOR, 2)
+            cv2.line(panel, (right_x, 0), (right_x, height - 1), WALL_COLOR, 2)
             cv2.line(panel, (center_x, 0), (center_x, height - 1), CENTERLINE_COLOR, 1)
 
     title = (
@@ -1284,8 +1294,8 @@ def make_roi_debug_panel(result: dict[str, Any], debug: dict[str, Any]) -> np.nd
         cv2.line(plot, (x, plot_height - 1), (x, y), (0, 0, 0), 1)
 
     if result["status"] == "ok":
-        cv2.line(plot, (int(result["left_x"]), 0), (int(result["left_x"]), plot_height - 1), LEFT_BOUNDARY_COLOR, 1)
-        cv2.line(plot, (int(result["right_x"]), 0), (int(result["right_x"]), plot_height - 1), (0, 160, 0), 1)
+        cv2.line(plot, (int(result["left_x"]), 0), (int(result["left_x"]), plot_height - 1), WALL_COLOR, 1)
+        cv2.line(plot, (int(result["right_x"]), 0), (int(result["right_x"]), plot_height - 1), WALL_COLOR, 1)
 
     return np.vstack([panel, plot])
 
@@ -1313,13 +1323,16 @@ def make_debug_mosaic(panels: list[np.ndarray], target_width: int = 230, columns
     return np.vstack(rows)
 
 
-def detect_all(gray: np.ndarray, roi_payload: dict[str, Any], config: DetectionConfig) -> tuple[list[dict[str, Any]], list[np.ndarray]]:
+def detect_all(
+    gray: np.ndarray, roi_payload: dict[str, Any], config: DetectionConfig, *, debug_panels_enabled: bool = True
+) -> tuple[list[dict[str, Any]], list[np.ndarray]]:
     results: list[dict[str, Any]] = []
     debug_panels: list[np.ndarray] = []
     for roi in roi_payload.get("rois", []):
         result, debug = detect_roi(gray, roi, config)
         results.append(result)
-        debug_panels.append(make_roi_debug_panel(result, debug))
+        if debug_panels_enabled:
+            debug_panels.append(make_roi_debug_panel(result, debug))
     return results, debug_panels
 
 

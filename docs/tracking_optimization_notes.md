@@ -361,8 +361,4 @@ python track_main_tube_sequence.py `
 --min-roi-update-confidence low
 ```
 
-如果某些竖直 ROI 因为管身纹理太单一而沿 y 方向跟不动，默认的群体下移先验会用其他 ROI 的累计下移中位趋势补偿它。需要关闭时：
-
-```powershell
---vertical-motion-prior none
-```
+各 ROI 根据本区域内的帧间运动和管壁证据更新。
