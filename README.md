@@ -1,355 +1,202 @@
-# main_tube_detect 项目文档
+# StereoTracking · 双目图像序列中的管壁提取与跟踪
 
-## 运行跟踪
+在每台相机的首帧圈出想观察的管道，程序逐帧跟随各个选区（ROI），在原始图像坐标中测量管道两侧边缘和中心线。全局视频用来看有没有跟错管，局部放大视频用来看两侧线是否贴壁。需要做双目分析时，再按采集时间将左右两路测量放到同一行。
 
-双击项目根目录的 **`run_testbmp_live.cmd`**，默认读取 `testbmp` 中的 BMP 图片，按文件名时间戳排序。在首帧沿管道外围依次左击至少三个点，将两侧管壁框入选区。按 **N** 完成一根，可继续框选其他管道。按 **Enter** 开始跟踪。
+**本阶段交付的是二维图像测量和左右帧的时间配对。** 左右相机分别框选，`R1` 等编号只在各自的选区文件内有效。跨视图比较同一根管道前，需要确认两个编号对应的实物。相机标定、三维直线重建和位姿求解属于后续步骤。
 
-**更换图片文件夹**时，在项目根目录打开 PowerShell，运行同一个脚本，将引号中的路径替换为实际图片目录。新的序列会从首帧重新框选。
+## 1. 第一次启动
 
-```powershell
-.\run_testbmp_live.cmd -ImageDir "D:\采集数据\第二组"
-```
-
-默认匹配 `*.bmp`。处理 PNG 序列时，在命令末尾加上 `-Pattern "*.png"`。如需复用同机位、相同分辨率的选区，添加 `-InitialRois "选区文件的完整路径\drawn_rois.json"`。
-
-预览中两侧管壁均为青色，中心线为黄色。当前帧的管壁无法确认时，画面显示红底 **LOST**，JSON 中的 `centerline` 为 `null`。滚轮以指针为中心缩放，按住右键拖动平移，**R** 恢复全图。**P** 暂停，**N** 单步，**C** 继续，**Q** 提前结束并保存已处理的帧。
-
-每次运行的结果保存在 **`tracking_results/runs/<启动时间>/`**。全局视频为 `tracking_review_*.mp4`，局部放大视频为 `roi_review_*.mp4`，逐帧结果为 `sequence_centerlines_*.json`。手动框选时还会生成 `drawn_rois.json`。历史结果已归到 `tracking_results/archive/`。
-
-### 真实数据较大时如何分享诊断结果
-
-在现场电脑打开项目目录的 PowerShell，开启诊断模式。默认仍会录制两份视频，只想查看预览并导出诊断包时可再加 `-NoVideo`。
+以下命令在 Windows PowerShell 中执行。现场使用 Python 3.12.7、OpenCV 和 NumPy，计算在 CPU 上完成。先准备同一机位、按时间连续的至少两张图片，左右相机分开放。仓库提供源代码和测试，现场 BMP、手绘选区及录像保存在采集电脑上。
 
 ```powershell
-.\run_testbmp_live.cmd -ImageDir "D:\采集数据\第二组" -Diagnostics
+git clone https://github.com/urheipi/stereotracking.git
+cd stereotracking
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-运行完成后，分享本次 `tracking_results/runs/<启动时间>/` 内的 **`*_diagnostics.zip`** 即可。里面有逐帧测量表、各选区的丢失统计，以及最多 32 张局部原图与画线结果。程序只在本机打包。若你在预览中看到了误跟，附上帧号、ROI 编号和希望跟踪的管道位置，会更容易定位。字段说明见 [handoff.md](handoff.md)。
+已克隆仓库的电脑可在项目根目录执行 `git pull --ff-only origin main` 更新主分支。本阶段最终版的固定标签为 `tracking-final-2026-11-27`。
 
-## 项目实现了什么功能
+在项目根目录运行以下命令，把路径换成自己的图片目录。这里先处理右相机。
 
-本项目用于在图像中的多边形 ROI 内检测主导管的左右边界和中心线，并支持把首帧 ROI 跟踪到后续图像序列中，逐帧输出主导管中心线结果。
-
-序列跟踪统一从 `track_main_tube_sequence.py` 运行。它在每一帧调用 `detect_main_tube.py` 提取两侧管壁和中心线。
-
-核心能力如下：
-
-- 支持读取灰度图或彩色图，并兼容包含中文路径的图像读写。
-- 支持从 JSON 读取 ROI，也支持交互式绘制多边形 ROI。
-- 在每个 ROI 内检测主导管左右边界、中心线、置信度和调试指标。
-- 输出完整检测结果 JSON、简化中心线 JSON、叠加可视化图和可选调试图。
-- 对图像序列支持从首帧 ROI 自动传播到下一帧，再调用单帧检测器提取每帧中心线。
-- 可生成序列复核视频，也可打开交互式窗口逐帧检查。
-
-这个项目不是基于深度学习训练模型的检测器，而是基于传统计算机视觉和几何规则的 ROI 内目标检测与跟踪流程。
-
-## 项目文件说明
-
-```text
-main_tube_detect/
-├── detect_main_tube.py                 # 单张图像 ROI 内主导管检测
-├── track_main_tube_sequence.py         # 图像序列 ROI 跟踪与中心线汇总
-├── test_detect_main_tube.py            # 单图检测相关测试
-├── test_track_main_tube_sequence.py    # 序列跟踪相关测试
-├── pic/                                # 示例图像
-├── output/                             # 单图检测输出示例
-├── tracking_results/                   # 序列跟踪输出示例
-└── docs/                               # 额外算法说明文档
+```powershell
+.\run_testbmp_live.cmd -Camera right -ImageDir "D:\采集数据\右相机"
 ```
 
-## 使用的主要算法
+1. 在首帧沿一段管道的外围依次左击至少三个点。框内应包含两侧管壁及少量外侧背景，长边尽量沿着管道。按 **N** 完成一根，再画下一根。**U** 撤销当前选区的上一个点。
+2. 按 **Enter** 开始跟踪。在预览窗口滚轮缩放，右键拖动平移，**R** 恢复全图。**P** 暂停，**N** 单步，**C** 连续播放，**Q** 提前结束并保存已处理的部分。
+3. 看青色的两侧管壁和黄色的中心线。红底 **LOST** 表示这根管道在当前帧缺少可信测量，程序继续在后续帧搜索。
 
-### 1. ROI 几何拉正
+另一台相机用同一个命令，将 `-Camera` 改为 `left` 并更换目录。若已在项目根目录放好 `testbmp\` 测试图，可直接双击 `run_testbmp_live.cmd`。默认读取 `*.bmp`，按文件名开头的数字时间戳排序。PNG 序列加 `-Pattern "*.png"`，用文件名顺序的序列可加 `-SortBy name`。
 
-对应代码：`_basis_from_polygon()`、`rectify_polygon()`
+### 复用选区，批量生成视频
 
-程序先对用户提供的多边形 ROI 使用 `cv2.minAreaRect()` 求最小外接旋转矩形，取长边方向作为主导管的大致延伸方向，取其垂直方向作为宽度方向。然后基于这两个方向建立局部坐标系，并用 `cv2.remap()` 将原图 ROI 重采样为一个拉正后的矩形小图。
+在本机的现场目录中，`trackingbmp` 对应左相机，`trackingright` 对应右相机。首次框选完成后，在项目根目录执行：
 
-这一步的目的，是把原图中可能倾斜、旋转的导管区域转换成更规则的局部图像，使主导管左右边界在拉正图中尽量接近两条竖直长边。
-
-### 2. Sobel 梯度边缘证据
-
-对应代码：`_edge_evidence()`
-
-拉正 ROI 后，程序先做高斯滤波降低噪声，再用 Sobel 算子计算水平和垂直方向梯度：
-
-```text
-gx = x 方向梯度
-gy = y 方向梯度
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_tracking.ps1 -ImageDir "F:\tracking_test\trackingbmp"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_tracking.ps1 -ImageDir "F:\tracking_test\trackingright"
 ```
 
-主导管的左右边界在拉正图中通常表现为竖直边，因此灰度变化主要发生在 x 方向。程序用 `abs(gx)` 作为主要边缘强度，并通过方向权重过滤掉更像横向纹理或噪声的响应。
+这两条命令都调用 `track_main_tube_sequence.py`。批处理在对应机位的历史运行里查找与**首帧路径相同**的已存选区。图片换盘后，显式传入 `-InitialRois "原运行目录\drawn_rois.json"` 即可复用同一画面的选区。换机位或取景后，回到交互命令重新画。其他名称的目录用 `-Camera left` 或 `-Camera right` 指明机位。
 
-最终得到的 `evidence` 可以理解为“某个像素像主导管竖直边界的程度”。
+| 常用选项 | 用途 |
+| --- | --- |
+| `-MaxFrames 40` | 先处理前 40 帧，快速检查选区和贴壁效果。默认处理全部。 |
+| `-Diagnostics` | 额外生成本地诊断包，含按 ROI 汇总的丢失时段、逐帧判定依据和最多 32 张局部样图。适合无法传整套原图的情况。 |
+| `-NoVideo` | 只需数值结果时跳过两份视频的编码。 |
+| `-TrackScale 0.5` | 在较低分辨率估计运动，管壁检测仍用原始分辨率。细线场景应核对效果；本次现场结果使用默认值 1。 |
+| `-OutDir "D:\指定目录"` | 覆盖默认结果目录。正常使用时由程序按机位归档。 |
 
-### 3. 列投影和一维峰值搜索
+## 2. 程序怎样从一帧走到下一帧
 
-对应代码：`_edge_evidence()`、`_smooth_1d()`、`_find_profile_peaks()`
-
-程序只在 ROI 掩膜内部统计边缘证据，把每一列的边缘强度沿 y 方向求平均，形成一维宽度剖面 `profile`。真实的左右导管边界会在很多行上连续出现，因此会在 `profile` 中形成明显峰值。
-
-程序对 `profile` 做一维高斯平滑，然后寻找局部峰值，并设置最小间隔，避免同一条边界附近产生多个重复候选。
-
-### 4. 边界对评分
-
-对应代码：`find_edge_pair()`、`_boundary_support()`
-
-程序枚举峰值中的两两组合，把每一对候选看作“左边界 + 右边界”，并根据以下指标打分：
-
-- 宽度约束：两条边之间的距离必须落在 `min_width_frac` 和 `max_width_frac` 之间。
-- 连续性：候选边界附近有多少有效行存在足够强的边缘响应。
-- 边缘对比度：候选峰值相对整体剖面背景是否突出。
-- 宽度先验：过窄或过宽的候选会被降低权重。
-
-得分最高的一对边界作为主导管左右边界候选。如果没有满足几何和边缘条件的候选，则该 ROI 标记为 `failed`。
-
-### 5. 前景宽度修正
-
-对应代码：`_foreground_column_profile()`、`_foreground_span_around()`、`_refine_pair_with_foreground_span()`
-
-当 ROI 内前景和背景存在足够灰度差时，程序会额外统计较暗前景在每一列中的占比，估计主导管的整体前景宽度。如果初始边界对明显落在前景内部，程序会尝试用附近峰值把左右边界扩展到更合理的外侧边缘。
-
-这一步用于降低“内部强边缘被误选为外边界”的概率。
-
-### 6. 边界线拟合和中心线采样
-
-对应代码：`_fit_one_boundary_line()`、`_fit_boundary_lines()`、`_sample_boundaries()`、`map_rectified_point()`
-
-找到左右边界的大致 x 坐标后，程序会在每一行附近搜索局部最大边缘响应，收集边界采样点，并用加权一次直线拟合：
-
-```text
-x = slope * y + intercept
+```mermaid
+flowchart TD
+    A[选好一台相机的有序图片] --> B[首帧手绘或读取 ROI]
+    B --> C[在当前 ROI 中测量左右管壁和中心线]
+    C --> D[检查双壁证据和跨帧一致性]
+    D --> E[记录当帧测量或 LOST]
+    D --> F[用可信检测校正搜索框，异常时保留搜索范围]
+    F --> G[下一帧用光流或模板预测 ROI]
+    G --> C
+    E --> H[逐帧 JSON、全局与局部视频]
+    H --> I[两台相机分别完成后按时间配对]
 ```
 
-左右边界需要满足斜率接近、残差合理、支撑行数足够等条件。拟合通过后，程序使用共同斜率构造近似平行的左右边界线，再取两条边界中点作为中心线。
+这里有两种用途不同的“特征”。**管壁边缘**回答“这一帧的中心线在哪里”，**选区里的角点**回答“下一帧去哪里找这根管”。角点跟踪成功后，程序仍会在新位置重新量两侧管壁。这也是为什么某根管道的运动状态可以是 `ok`，而该帧的测量状态是 `lost`。
 
-最后，所有边界点和中心线点都会通过 `map_rectified_point()` 从拉正图坐标映射回原始图像坐标。
+### 2.1 单帧提取：从两个边缘得到一条中心线
 
-### 7. 置信度评估
+1. **将选区拉正。** `rectify_polygon()` 用多边形的最小外接旋转矩形确定长短轴，将灰度图重采样到局部坐标。纵向 `y` 沿管，横向 `x` 横跨管径，多边形掩膜限定有效像素。因此水平、竖直、倾斜的管道可以共用后续流程。
+2. **在横截面上找候选边。** 高斯平滑后计算横向和纵向 Sobel 梯度。沿管延伸的边缘在横向灰度变化更强，获得更高权重。将有效行的响应按列平均并平滑，就得到一条横跨管径的一维曲线，曲线的峰是候选管壁。跨过管身的短细线通常只能影响部分行。
+3. **把两条边作为一对选择。** `find_edge_pair()` 枚举候选峰对。默认两峰间距占拉正窗口宽度的 0.28–0.92；评分还考虑边缘强度、沿管连续性、同一截面两壁是否同时有合理亮度变化，以及近期确认的管宽。饱和天空下的外轮廓与窄反光边有各自的证据检查。靠近细栏杆时，可用随管宽缩放的横向闭运算辅助选峰，再用原图的亮度变化核对管壁。
+4. **拟合两侧边界。** 在每个峰附近逐行取支持点，用加权直线拟合得到 `x(y) = a·y + b`。按残差剔除偏离点后重新拟合。左右斜率有分歧时，沿候选方向比较整段支持，让清楚的一侧约束另一侧。双壁拟合不足时可退回候选列采样，发布测量仍须通过可见性检查。
+5. **求中点并映回原图。** 对有效管段取多个截面，默认最多 60 个。通常每行取 `x中心(y) = (x左(y) + x右(y)) / 2`，再通过长短轴映射回原图。比如一行的两壁在 41 和 121 像素，中心就在 81 像素。序列也支持有条件的前景修正，输出字段 `centerline_source` 可区分 `edge-midpoint` 与 `foreground-body`。双壁稳定时保留中点。实现见 [detect_main_tube.py](detect_main_tube.py)。
 
-对应代码：`find_edge_pair()`
+### 2.2 跨帧跟踪：预测位置，再用实测管壁校正
 
-检测成功后，程序根据连续性、边缘对比度和宽度比例给出置信度：
+- **估计运动。** 在上一帧的多边形内用 Shi–Tomasi 选角点，再用金字塔 Lucas–Kanade 光流将点跟到下一帧，并反向跟回。往返误差过大的点会被剔除。RANSAC 从剩下的点估计平移、旋转和统一缩放，将同一个 ROI 的顶点传播到新帧。
+- **处理运动估计失真。** 点都挤在管端时，局部位移足以估平移，外推整根管的旋转或缩放容易漂移，程序此时采用位移中位数。特征不足可回退到模板匹配。若只有少量内点却给出大位移或明显缩放，匹配范围会带上管道周围的纹理，以区分沿管方向看起来几乎相同的图块。
+- **修正搜索框。** 默认 `detect-corrected` 模式在新帧测得双壁后，用带余量的边界框校正下次的起点。当前管宽、首次确认的长度和近期尺寸历史共同约束搜索范围。遇到曝光突变、异常收缩或跳变时，程序可以拒绝更新搜索框，避免随后把背景越跟越牢。
+- **控制开销。** 角点检测使用选区裁剪和掩膜，光流只在包含允许位移和金字塔边界余量的范围内计算。每帧灰度图由各选区共用；单帧管壁采样用数组运算。`-NoVideo` 可以单独省下渲染和编码耗时。实现见 [track_main_tube_sequence.py](track_main_tube_sequence.py)。
 
-- `high`：边界连续、对比明显、宽度合理。
-- `medium`：边界基本成立，但连续性或对比度一般。
-- `low`：找到了候选边界，但质量较弱。
-- `failed`：没有找到有效边界对。
+### 2.3 为什么会显示 LOST
 
-### 8. 序列 ROI 跟踪
+默认要求候选至少达到中等置信度，且至少 20% 的截面同时支持两壁。与上一有效候选比较时，管宽比须在 `2/3–1.5` 之间。扣除搜索框自身的运动后，中心线沿管壁法向的跳动默认最多为 7 个原图像素。证据中断后重新捕获通常需要连续两帧相符的候选。
 
-对应代码：`track_rois_between_frames()`、`_estimate_roi_transform()`
+**真实例子：右相机第 394 帧的 R7。** 光流的 `tracking.status` 是 `ok`，双壁支持率约为 0.86，但中心线横向位置与前帧不一致。最终 `status` 为 `lost`，`failure_reason` 为 `inconsistent lateral position`，`centerline` 为 `null`。下游读取测量时应先看最外层 ROI 的 `status`。
 
-序列处理不重新让用户逐帧画 ROI，而是从首帧 ROI 开始跟踪到下一帧。使用的算法链路是：
+若只是管段变短，程序还会单独评估两壁实际共同可见的一段。双壁均有拟合、各自至少覆盖窗口三分之一、共同可见段内至少半数截面支持双壁、管宽与近期值相差不超过 10%，且候选框仍达到预测长度的 60% 时，可以保留较长的搜索框，同时输出较短的实测线段。
 
-1. 在上一帧 ROI 掩膜内用 `cv2.goodFeaturesToTrack()` 提取角点特征。
-2. 用金字塔 Lucas-Kanade 光流 `cv2.calcOpticalFlowPyrLK()` 跟踪特征点到下一帧。
-3. 再反向跟踪回上一帧，用 forward-backward error 过滤不稳定点。
-4. 用 `cv2.estimateAffinePartial2D()` 和 RANSAC 估计上一帧到下一帧的局部仿射变换。
-5. 将该变换应用到 ROI 顶点，得到下一帧 ROI。
-6. 对下一帧传播后的 ROI 再调用单帧检测器提取主导管中心线。
+## 3. 怎样读输出
 
-当仿射估计失败时，程序会使用跟踪点的中位平移量作为降级方案；如果跟踪点不足，则保留上一帧 ROI 位置并记录失败原因。
+默认写入 `tracking_results/runs/left_camera/<运行时间>/` 或 `right_camera/<运行时间>/`。
 
-## 单张图像检测流程
+| 文件 | 怎么用 |
+| --- | --- |
+| `drawn_rois.json` | 手绘时保存。记录首帧图像、`roi_idx` 和原图多边形顶点，供同一序列重跑。 |
+| `tracking_review_*.mp4` | 全局画面。灰框及框内标签作显示平滑；青色双壁线、黄色中心线、红底 LOST 随当帧测量更新。 |
+| `roi_review_*.mp4` | 同一帧的所有 ROI 分格放大。每格保留首帧的方向和放大倍率，跟随当前区域，适合核对哪一侧贴到了栏杆、反光或遮挡物。 |
+| `sequence_centerlines_*.json` | 原图坐标下的二维测量。`frames[n-1]` 对应视频画面上标注的第 `n` 帧，`image` 指向原图，`centerlines` 中按 `roi_idx` 查找管道。 |
+| `*_diagnostics.zip` | 开启诊断时生成。先读 `summary.json` 找时段，再用 `measurements.csv` 和 `samples/` 对照判定依据。 |
 
-```text
-输入图像 + ROI JSON 或交互式绘制 ROI
-        |
-        v
-标准化 ROI 数据
-        |
-        v
-逐个 ROI 拉正为局部矩形图
-        |
-        v
-计算 Sobel 边缘证据和列方向 profile
-        |
-        v
-寻找候选峰值并选择最佳左右边界对
-        |
-        v
-拟合左右边界线并计算中心线
-        |
-        v
-映射回原图坐标
-        |
-        v
-输出 results.json、centerline_results.json、overlay_detected.png
+JSON 中的 `vertices` 是实际搜索框。`centerline.endpoints` 按 `[x1, y1, x2, y2]` 存储，像素原点在原图左上，`x` 向右、`y` 向下。`line_eq` 给出归一化二维直线 `Ax + By + C = 0`。历史字段 `plucker` 存储三个二维线段量 `[x1·y2 − y1·x2, x2 − x1, y2 − y1]`，三维直线重建需要另外使用相机几何。`wall_pair_coverage` 表示同一截面能同时支持两壁的比例，`tracking` 保存运动估计和框更新信息。默认回放为 10 fps，第 `n` 帧的播放时间为 `(n−1)/10` 秒；现场采集间隔应从原图时间戳读取。
+
+## 4. 双目时间匹配
+
+左右相机各自按原始帧序跟踪。离线配对使用**文件名里的采集时间**，两侧相差 **≤ 1,000 毫秒**视作同步，每张图最多使用一次。本次文件名有两种时间表示，例如 `63883096137007_2025-05-17 16-28-47_307.bmp`。用开头的毫秒整数筛选，再独立用后半段日期、时分秒和毫秒核对。此次所有候选均唯一，两种方法得到完全相同的配对。
+
+| 左图 | 右图 | 唯一配对 | 无对应图的单机帧号（从 1 开始） |
+| ---: | ---: | ---: | --- |
+| 988 | 991 | 987 | 左 623；右 35、147、554、770 |
+
+现场配对表为 `tracking_results/stereo_pairs_20250517.csv`。同一行的 `left_frame` 和 `right_frame` 分别查左右视频或 JSON。例如第 348 对用左第 348 帧和右第 350 帧，两图文件名后半段的时刻相差 199 ms。全表前缀时间差绝对值最大 75 ms，后半段时刻差最大 416 ms。配对成功表示满足此次采集的时间容差；同一根管道在哪些帧上有两路测量，还需分别检查两个 ROI 的状态。
+
+<details>
+<summary>复现配对表：从两份跟踪 JSON 生成 CSV，并打印所有落单的原图</summary>
+
+在项目根目录的 PowerShell 运行下段示例。把 `left_json` 和 `right_json` 换成本次左右运行的文件，保留各自的帧序。示例只读取 JSON 中的文件名，适用于上面这种双时间戳命名。若两个时间字段结论冲突、一个窗口里有多个候选，或右图被重复使用，会指出需要人工核对的图。输出写到独立的 `stereo_pairs_rebuilt.csv`。
+
+```powershell
+@'
+import csv
+import json
+from datetime import datetime
+from pathlib import Path, PureWindowsPath
+
+runs = Path("tracking_results/runs")
+left_json = runs / "left_camera/20261127_140424_876/sequence_centerlines_20261127_140424.json"
+right_json = runs / "right_camera/20261127_123923_274/sequence_centerlines_20261127_123923.json"
+output = Path("tracking_results/stereo_pairs_rebuilt.csv")
+
+def read_frames(path):
+    frames = json.loads(path.read_bytes())["frames"]
+    result = []
+    for frame in frames:
+        name = PureWindowsPath(frame["image"]).name
+        prefix, clock = Path(name).stem.split("_", 1)
+        result.append((int(prefix), datetime.strptime(clock, "%Y-%m-%d %H-%M-%S_%f"), name))
+    return result
+
+left, right = read_frames(left_json), read_frames(right_json)
+rows, used_right = [], set()
+for i, (ts, clock, name) in enumerate(left, 1):
+    by_prefix = [j for j, r in enumerate(right) if abs(r[0] - ts) <= 1000]
+    by_clock = [j for j, r in enumerate(right) if abs((r[1] - clock).total_seconds()) <= 1]
+    if by_prefix != by_clock or len(by_prefix) > 1:
+        raise ValueError(f"Review timestamps for {name}")
+    if not by_prefix:
+        print("Left only:", i, name)
+        continue
+    j = by_prefix[0]
+    if j in used_right:
+        raise ValueError(f"Right frame used twice: {right[j][2]}")
+    used_right.add(j)
+    rt, rc, rn = right[j]
+    rows.append((len(rows) + 1, i, name, j + 1, rn, rt - ts, round((rc - clock).total_seconds() * 1000)))
+for j, (_, _, name) in enumerate(right):
+    if j not in used_right:
+        print("Right only:", j + 1, name)
+with output.open("w", newline="", encoding="utf-8-sig") as f:
+    writer = csv.writer(f)
+    writer.writerow(("pair_id", "left_frame", "left_file", "right_frame", "right_file",
+                     "prefix_delta_ms_right_minus_left", "clock_delta_ms_right_minus_left"))
+    writer.writerows(rows)
+print(len(rows), "pairs:", output)
+'@ | .\.venv\Scripts\python.exe -
 ```
 
-示例命令：
+</details>
 
-```bash
-python detect_main_tube.py --image pic/1.bmp --draw-rois --out-dir output/1_draw --debug
+## 5. 现场问题、修复依据与剩余误差
+
+| 当时看到的现象 | 原因、改动和复核结果 |
+| --- | --- |
+| 左 R1 在天空与格栅交界处偏离边缘，R3 在约第 830 帧被管内斜线带偏 | 同一管壁在不同背景上可能改变明暗方向。以多种距离核对窄反光边，并用对侧管壁提供独立证据；沿整段比较拟合方向，降低少数强干扰行的影响。左 R1 第 895 帧的抽查截面偏差从约 21.8 降到 1.0 原图像素，左 R3 第 830 帧左壁上部从约 5.7 降到 2.0 像素。 |
+| 右 R7 从第 239 帧起跟丢，搜索框跳到其他位置 | 横穿管道的细线上只剩少数角点，却给出约 125 像素位移。加入周边纹理复核后，991 帧里的丢失由 755 帧降至 1 帧。 |
+| 右 R1 遇到横梁，明明还有一段管壁却报丢 | 整个框内的支持率会被遮挡段稀释。对确实变短的管段检查双壁共同支持范围，丢失由 56 帧降至 8 帧。第 89、330 帧可看到剩余可见段。 |
+| 右 R10 末段的边线贴到栏杆，曝光变化时左 R6 等选区误收缩 | 栏杆和管壁间的窄亮缝会形成额外强边。使用管宽先验、窄暗条抑制及原图亮度复核，右 R10 的丢失由 43 帧降至 0 帧，抽查第 930、970、991 帧确认贴壁。曝光保护会保留合理搜索范围，等待双壁重新可见。 |
+| 全局画面的框和标签跳动 | 可见长度逐帧变化，框端点与标签随之往返。对齐相邻多边形顶点，沿管方向平滑，横向滞后限制在当前框宽的 7% 内，标签锚定在框内。右 R1 第 301–400 帧的成片标签位移第 95 百分位从 24.2 降到 10.0 原图像素。两路的逐帧测量和局部视频均与平滑前一致。 |
+
+**最终现场验收。** 两路各跟踪 10 根管道。右侧 9,910 次逐管测量中有 10 次 LOST（R1 八次、R7 一次、R9 一次）；左侧 9,880 次中有 49 次（R6 两次、R9 十二次、R10 三十五次）。右侧算法修复前共有 855 次，左侧上一版为 43 次。左 R10 在第 350 帧附近的曝光变化仍值得复查。丢失次数衡量的是程序是否发布测量，沿边定位误差只对可辨认的截面做过抽查。两台相机来自同一次采集，其他现场和镜头仍需独立验证。
+
+## 6. 源码阅读与测试
+
+| 阅读顺序 | 可以带着什么问题读 |
+| --- | --- |
+| [序列主流程](track_main_tube_sequence.py) | 从 `run_sequence()` 看一帧如何经过运动预测、单帧检测、可见性判断、框更新与输出。再读 `_estimate_roi_transform()`、`assess_visibility()` 和 `reject_invalid_updates()`。 |
+| [单帧检测](detect_main_tube.py) | 从 `detect_roi()` 顺着 `rectify_polygon()`、`find_edge_pair()`、`_fit_boundary_lines()`、`_sample_boundaries()` 看一对管壁如何变成原图中心线。 |
+| [录像](tracking_videos.py)、[交互预览](review_window.py)、[诊断](tracking_diagnostics.py) | 看原图坐标怎样投影到局部视频，缩放与步进怎样工作，丢失时保存哪些证据。全局显示框的平滑在单帧检测模块的 `_review_polygon()` 中，由序列渲染调用。 |
+| [检测测试](test_detect_main_tube.py)、[序列测试](test_track_main_tube_sequence.py) | 用合成管道复现窄栏杆、反光、斜线、错误光流及遮挡后重捕获，适合调试时逐个运行。 |
+
+在项目根目录验证安装和实现：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m unittest -q
+.\.venv\Scripts\python.exe -m ruff check .
 ```
 
-使用已有 ROI JSON：
+本阶段提交前，在全新的 Python 3.12 虚拟环境中按依赖文件安装了 NumPy 2.4.6 和 OpenCV 4.13.0.92，80 项单元测试及 Ruff 检查通过。另用现场选区通过 PowerShell 启动脚本处理 3 张实图，读回了两份视频和逐帧 JSON；第 4 节示例生成的 CSV 与现场 987 对配对表逐字节一致。
 
-```bash
-python detect_main_tube.py --image pic/1.bmp --rois output/1_draw/drawn_rois.json --out-dir output/verify --debug
-```
-
-ROI JSON 支持以下格式：
-
-```json
-{
-  "image": "pic/1.bmp",
-  "rois": [
-    {
-      "roi_idx": 1,
-      "vertices": [[100, 120], [140, 300], [210, 290], [180, 110]]
-    }
-  ]
-}
-```
-
-兼容旧字段 `roi_points`，程序会统一转换为 `vertices`。
-
-## 图像序列处理流程
-
-```text
-输入有序图像序列
-        |
-        v
-读取或绘制首帧 ROI
-        |
-        v
-首帧直接运行单图检测
-        |
-        v
-从上一帧 ROI 内提取角点
-        |
-        v
-LK 光流跟踪到下一帧
-        |
-        v
-forward-backward 误差过滤
-        |
-        v
-RANSAC 估计局部仿射变换
-        |
-        v
-传播 ROI 到当前帧
-        |
-        v
-当前帧运行单图检测
-        |
-        v
-循环直到所有帧处理完成
-        |
-        v
-输出 sequence_centerlines.json 和可选 tracking_review.mp4
-```
-
-按目录读取图像：
-
-```bash
-python track_main_tube_sequence.py --image-dir pic --pattern "*.bmp" --initial-rois output/1_draw/drawn_rois.json --out-dir tracking_results
-```
-
-显式指定有序图像：
-
-```bash
-python track_main_tube_sequence.py --images pic/1.bmp pic/2.bmp pic/3.bmp pic/4.bmp --initial-rois output/1_draw/drawn_rois.json --out-dir tracking_results
-```
-
-如果不需要实时窗口：
-
-```bash
-python track_main_tube_sequence.py --image-dir pic --pattern "*.bmp" --initial-rois output/1_draw/drawn_rois.json --out-dir tracking_results --no-window
-```
-
-## 输出文件
-
-单图检测默认输出到 `--out-dir`：
-
-- `results.json`：完整检测结果，包括 ROI、左右边界采样点、中心线采样点、宽度、连续性、候选峰值和置信度。
-- `centerline_results.json`：简化中心线结果，只保留每个 ROI 的中心线端点、二维 Plucker 表达和直线方程。
-- `overlay_detected.png`：原图上的检测叠加图。
-- `debug/roi_XX_rectified.png`：可选调试图，展示拉正 ROI、边界和 profile。
-- `debug/all_rois_rectified_eval.png`：可选调试拼图。
-
-序列处理默认输出到 `--out-dir`：
-
-- `sequence_centerlines.json`：每一帧的中心线摘要。
-- `tracking_review_*.mp4` 和 `roi_review_*.mp4`：同帧率的全画面和局部放大录像。指定自定义全局视频名时，局部视频使用同一文件名前缀加 `_rois.mp4`。
-- `drawn_rois.json`：如果使用 `--draw-rois`，会保存首帧交互绘制的 ROI。
-
-中心线摘要中的核心字段：
-
-```json
-{
-  "roi_idx": 1,
-  "status": "ok",
-  "confidence": "high",
-  "centerline": {
-    "endpoints": [x1, y1, x2, y2],
-    "plucker": [moment, dx, dy],
-    "line_eq": {"A": 0.0, "B": 1.0, "C": -10.0}
-  }
-}
-```
-
-其中 `line_eq` 表示原图坐标系下的二维直线方程：
-
-```text
-A*x + B*y + C = 0
-```
-
-## 关键参数
-
-### 单图检测参数
-
-- `--min-width-frac`：主导管最小宽度占拉正 ROI 宽度的比例，默认 `0.28`。
-- `--max-width-frac`：主导管最大宽度占拉正 ROI 宽度的比例，默认 `0.92`。
-- `--boundary-samples`：每个 ROI 输出的边界/中心线采样点数量，默认 `60`。
-- `--debug`：输出拉正 ROI 和 profile 调试图。
-
-### 序列跟踪参数
-
-- `--track-scale`：光流跟踪使用的缩放比例，默认 `0.5`。检测结果和 JSON 仍保持原图坐标。
-- `--max-corners`：每个 ROI 内最多提取的角点数量，默认 `80`。
-- `--min-track-points`：每个 ROI 至少需要的有效跟踪点数量，默认 `3`。
-- `--max-forward-backward-error`：正反向光流误差阈值，默认 `1.5` 像素。
-- `--review-mode`：复核窗口模式，支持 `step` 和 `continuous`。
-- `--pause-on`：连续复核时遇到 `failed` 或 `low` 是否暂停。
-
-## 依赖环境
-
-项目依赖 Python、OpenCV 和 NumPy：
-
-```bash
-pip install opencv-python numpy
-```
-
-运行测试：
-
-```bash
-python -m unittest
-```
-
-开发环境可额外安装 pytest 和 Ruff，并运行统一质量检查：
-
-```bash
-pip install -r requirements-dev.txt
-python -m pytest -q
-ruff check .
-```
-
-## 适用场景和限制
-
-适用场景：
-
-- 用户已经知道主导管大致位置，并能给出覆盖主导管的多边形 ROI。
-- 主导管左右边界在 ROI 内具有较稳定的灰度边缘。
-- 图像序列相邻帧运动较小，ROI 内有足够纹理或角点可用于光流跟踪。
-
-主要限制：
-
-- 该方法依赖 ROI，不能在整张图中自动搜索所有导管。
-- 如果 ROI 没有覆盖完整主导管，或包含过多强干扰边缘，检测可能偏移。
-- 如果导管边缘对比度很低、严重遮挡或反光过强，置信度会下降。
-- 序列跟踪依赖相邻帧局部仿射近似，过大形变或特征点不足会导致 ROI 传播失败。
-#   s t e r e o t r a c k i n g  
- 
+需要回到具体帧排查时，交接记录列有本机原图、原始选区、历次运行及最终视频路径。克隆到另一台电脑后，先准备该机能访问的原图和选区，再按本文第 1 节运行。[现场交接记录](handoff.md) · [检测流程详解](docs/current_detection_workflow.md)

@@ -5,7 +5,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from detect_main_tube import CENTERLINE_COLOR, TUBE_LINES, WALL_COLOR, _basis_from_polygon
+from detect_main_tube import CENTERLINE_COLOR, TUBE_LINES, WALL_COLOR, _basis_from_polygon, draw_roi_label
 
 
 TILE_WIDTH, TILE_HEIGHT = 168, 340
@@ -75,9 +75,12 @@ class TrackingVideos:
                     if len(line) >= 2:
                         cv2.polylines(tile, [_project(line, transform)], False, color, 2, cv2.LINE_AA)
             label = f"R{roi_id}" if visible else f"R{roi_id} LOST"
-            width = cv2.getTextSize(label, 0, .5, 1)[0][0]
-            cv2.rectangle(tile, (0, 0), (width + 8, 22), (30, 30, 30) if visible else (0, 0, 155), -1)
-            cv2.putText(tile, label, (4, 16), 0, .5, (255, 255, 255), 1, cv2.LINE_AA)
+            vertices = result.get("vertices")
+            if vertices is None or not draw_roi_label(tile, _project(vertices, transform), label, .38,
+                                                      (255, 255, 255), not visible):
+                # A missing or fully off-screen polygon still needs a tile ID and status.
+                badge = [[0, 0], [TILE_WIDTH - 1, 0], [TILE_WIDTH - 1, 22], [0, 22]]
+                draw_roi_label(tile, badge, label, .38, (255, 255, 255), not visible)
             y = HEADER + index // cols * TILE_HEIGHT
             x = index % cols * TILE_WIDTH
             sheet[y:y + TILE_HEIGHT, x:x + TILE_WIDTH] = tile

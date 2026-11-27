@@ -138,6 +138,92 @@ class CenterlineSummaryTest(unittest.TestCase):
 
 
 class RoiDetectionGeometryTest(unittest.TestCase):
+    def test_narrow_railing_next_to_pipe_is_excluded_from_the_measured_width(self):
+        roi = {"vertices": [[9, 3], [145, 3], [145, 385], [9, 385]], "expected_width": 80}
+        for gap in (3, 4, 5):
+            gray = np.full((390, 156), 255, np.uint8)
+            gray[:, :24] = 64
+            gray[:, 32:43-gap] = 56
+            gray[:, 43-gap:43] = 210
+            gray[:, 43:123] = np.linspace(140, 40, 80)
+            for y in range(30, 390, 48):
+                gray[y:y+2, 24:43] = 64
+            result, _ = dmt.detect_roi(gray, roi)
+            walls = sorted(np.median(np.asarray(result[k])[:, 0]) for k in ("left_boundary", "right_boundary"))
+            np.testing.assert_allclose(walls, [43, 123], atol=2)
+
+    def test_shallow_crossing_wire_does_not_rotate_the_pipe(self):
+        y, x = np.indices((700, 145))
+        wall = 35 + .01 * y
+        roi = {"vertices": [[18, 5], [118, 5], [118, 693], [18, 693]], "expected_width": 60}
+        for drift in (10, 20):
+            gray = np.where((x >= wall) & (x < wall + 60), 155, 250).astype(np.uint8)
+            gray[np.abs(x - wall - drift * (y / 699 - .5)) < 3] = 50
+            gray = cv2.GaussianBlur(gray, (5, 5), 1)
+            for scene in (gray, 255 - gray):
+                result, _ = dmt.detect_roi(scene, roi)
+                walls = sorted((np.asarray(result[k]) for k in ("left_boundary", "right_boundary")),
+                               key=lambda points: points[:, 0].mean())
+                for offset, points in zip((0, 60), walls, strict=True):
+                    np.testing.assert_allclose(points[:, 0], 35 + .01 * points[:, 1] + offset, atol=2)
+
+    def test_reflective_rim_supports_only_a_width_confirmed_pair(self):
+        _, x = np.indices((420, 150))
+        gray = np.where(x < 40, 202, np.where(x >= 101, 40, 90)).astype(np.uint8)
+        gray += (105 * np.exp(-.5 * ((x - 98) / 1.65) ** 2)).astype(np.uint8)
+        roi = {"vertices": [[20, 4], [122, 4], [122, 415], [20, 415]]}
+        measured, _ = dmt.detect_roi(gray, {**roi, "expected_width": 60})
+        self.assertGreater(measured["wall_pair_coverage"], .9)
+        for width in (None, 83):
+            unconfirmed, _ = dmt.detect_roi(gray, {**roi, "expected_width": width})
+            self.assertLess(unconfirmed["wall_pair_coverage"], .2)
+        # A darker upright behind the rim also makes a parallel edge pair.
+        gray[x < 24] = 140
+        with_background = {"vertices": [[8, 4], [122, 4], [122, 415], [8, 415]], "expected_width": 70}
+        measured, _ = dmt.detect_roi(gray, with_background)
+        self.assertAlmostEqual(measured["tube_width_px"], 61, delta=2)
+        gap = np.full((50, 90), 80, np.uint8)
+        gap[:, 40:52] = 235
+        self.assertFalse(dmt._bright_rim(gap, np.full_like(gap, 255), 46, 10, 12).any())
+
+    def test_badge_moves_inside_a_diagonal_polygon(self):
+        vertices = np.int32([[10, 12], [42, 7], [100, 135], [68, 140]])
+        previous = None
+        for dx, dy in ((0, 0), (22, 13)):
+            image = np.zeros((165, 160, 3), np.uint8)
+            polygon = vertices + np.int32([dx, dy])
+            self.assertTrue(dmt.draw_roi_label(image, polygon, "R1 LOST", .6, (255, 255, 255), True))
+            mask = cv2.fillPoly(np.zeros(image.shape[:2], np.uint8), [polygon], 255)
+            self.assertFalse(image[mask == 0].any())
+            marked = np.argwhere(image.any(axis=2))
+            self.assertGreater(len(marked), 20)
+            if previous is not None:
+                np.testing.assert_array_equal(marked, previous + [dy, dx])
+            previous = marked
+
+    def test_outer_walls_survive_a_parallel_railing_and_highlight_clipping(self):
+        height = 440
+        y, x = np.indices((height, 148))
+        offset = x - (30 + .004 * y)
+        body = (offset >= 0) & (offset < 70)
+        roi = {"roi_idx": 23, "vertices": [[16, 4], [123, 4], [125, 435], [18, 435]], "expected_width": 70}
+        for scene in ("railing", "bright"):
+            with self.subTest(scene=scene):
+                gray = np.full(x.shape, 255, np.uint8)
+                if scene == "railing":
+                    gray[body] = (40 + 145 * (offset[body] / 70) ** 2).astype(np.uint8)
+                    gray[(offset >= 79) & (offset < 85)] = 20
+                    gray[(y % 37 < 2) & (offset >= 70) & (offset < 85)] = 80
+                else:
+                    gray[body] = (249 - 94 * np.clip((offset[body] - 26) / 35, 0, 1)).astype(np.uint8)
+                result, _ = dmt.detect_roi(gray, roi)
+                self.assertIn(result["confidence"], ("medium", "high"))
+                self.assertGreater(result["wall_pair_coverage"], .4)
+                measurements = sorted(np.median(np.asarray(result[k])[:, 0]) for k in ("left_boundary", "right_boundary"))
+                np.testing.assert_allclose(measurements, [31, 101], atol=2)
+        blank, _ = dmt.detect_roi(np.full(x.shape, 255, np.uint8), roi)
+        self.assertEqual(blank["status"], "failed")
+
     def test_one_visible_wall_and_a_quantization_step_do_not_make_a_tube(self):
         gray = np.full((190, 130), 235, dtype=np.uint8)
         gray[:, :54] = 55

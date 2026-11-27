@@ -326,6 +326,20 @@ class RoiTrackingTest(unittest.TestCase):
         np.testing.assert_allclose(matrix[:, :2], np.eye(2))
         np.testing.assert_allclose(matrix[:, 2], np.median(moved - points, axis=0), atol=1e-4)
 
+    def test_sparse_flow_zoom_is_checked_against_the_whole_patch(self):
+        gray = np.random.default_rng(42).integers(0, 255, size=(180, 100), dtype=np.uint8)
+        vertices = np.float32([[25, 15], [70, 15], [70, 155], [25, 155]])
+        points = np.float32([(x, y) for y in range(20, 151, 20) for x in (30, 45, 60)])
+        status = np.zeros((len(points), 1), np.uint8)
+        status[[0, 2, 6, 8, 12, 14, -3, -1]] = 1
+        moved = (points - 50) * 1.23 + 50
+        with mock.patch.object(tracker, "_detect_roi_features", return_value=points), mock.patch.object(
+            cv2, "calcOpticalFlowPyrLK", side_effect=[(moved, status, None), (points, status, None)]
+        ):
+            matrix, info = tracker._estimate_roi_transform(gray, gray, vertices, 80, 3, 1.5)
+        self.assertEqual(info["method"], "template")
+        np.testing.assert_allclose(matrix, np.eye(2, 3))
+
     def test_track_rois_between_frames_template_fallback_handles_large_translation(self):
         prev_gray = np.zeros((130, 150), dtype=np.uint8)
         cv2.rectangle(prev_gray, (34, 34), (70, 62), 120, -1)
@@ -666,6 +680,23 @@ class RoiTrackingTest(unittest.TestCase):
         self.assertGreater(info["exposure_mean_delta"], 25.0)
         self.assertGreater(info["exposure_saturated_delta"], 0.15)
 
+    def test_held_exposure_window_can_publish_a_width_consistent_measurement(self):
+        roi = {"roi_idx": 2, "vertices": [[20, 10], [90, 10], [90, 150], [20, 150]]}
+        updates = [{"roi_idx": 2, "update_status": "rejected-exposure-shrink"}]
+        for width, status in ((56, "ok"), (26, "lost")):
+            result = dict(roi, status="ok", tube_width_px=width)
+            results, candidates = [result], {2: result}
+            tracker.reject_invalid_updates(results, updates, candidates, {2: 60})
+            self.assertEqual(results[0]["status"], status)
+            self.assertEqual(candidates[2] is None, status == "lost")
+
+    def test_accumulated_flow_shrink_cannot_exclude_the_second_wall(self):
+        roi = {"roi_idx": 4, "vertices": [[45, 60], [75, 60], [75, 150], [45, 150]]}
+        tracker._preserve_search_extent(roi, width=60, reference=(50, 250))
+        points = np.asarray(roi["vertices"])
+        np.testing.assert_allclose(points.mean(axis=0), [60, 105])
+        np.testing.assert_allclose(np.ptp(points, axis=0), [78, 255])
+
     def test_guard_exposure_shrunken_rois_rejects_active_exposure_shrink(self):
         predicted_payload = {
             "rois": [
@@ -791,6 +822,16 @@ class RoiTrackingTest(unittest.TestCase):
         self.assertEqual(output[0]["status"], "lost")
         self.assertEqual(output[0]["failure_reason"], "rejected-anchor-drift")
         self.assertEqual(measure()["status"], "lost")
+
+    def test_shorter_visible_segment_needs_two_fitted_walls(self):
+        update = {"roi_idx": 2, "update_status": "rejected-corrected-roi-shrink", "roi_long_span_ratio": .7}
+        for width, support, status in ((61, 65, "ok"), (61, 18, "lost"), (45, 65, "lost")):
+            result = {"roi_idx": 2, "vertices": [], "status": "ok", "tube_width_px": width,
+                      "wall_pair_coverage": .40, "segment_wall_pair_coverage": .73, "rectified_size": {"height": 100},
+                      "left_line": {"support_rows": 82}, "right_line": {"support_rows": support}}
+            outputs = [result]
+            tracker.reject_invalid_updates(outputs, [update], {2: result}, {2: 60})
+            self.assertEqual(outputs[0]["status"], status)
 
     def test_occluded_tube_shows_no_lines_until_two_visible_frames(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1029,6 +1070,30 @@ class RoiTrackingTest(unittest.TestCase):
 
 
 class ImageSourceTest(unittest.TestCase):
+    def test_saved_selection_and_default_outputs_follow_the_camera_and_first_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images = root / "trackingright"
+            images.mkdir()
+            gray = np.full((160, 120), 225, np.uint8)
+            gray[:, 45:75] = 50
+            for name in ("1.png", "2.png"):
+                tracker.dmt.write_image_unicode(images / name, gray)
+            roi = {"roi_idx": 1, "vertices": [[30, 10], [90, 10], [90, 150], [30, 150]]}
+            for side, run, first in (("right", "1", "1.png"), ("right", "2", "other.png"), ("left", "3", "1.png")):
+                directory = root / "runs" / f"{side}_camera" / run
+                directory.mkdir(parents=True)
+                (directory / "drawn_rois.json").write_text(json.dumps({"image": str(images / first), "rois": [roi]}))
+            cli = ["--images", str(images / "1.png"), str(images / "2.png"), "--no-window", "--no-video"]
+            args = tracker.parse_args(cli)
+            with mock.patch.object(tracker, "DEFAULT_OUTPUT_DIR", str(root)), contextlib.redirect_stdout(io.StringIO()):
+                result = tracker.run_sequence(args)
+                right = root / "runs" / "right_camera"
+                self.assertEqual(Path(result["initial_rois"]), right / "1" / "drawn_rois.json")
+                self.assertEqual(args._resolved_out_json.parent.parent, right)
+                with self.assertRaisesRegex(ValueError, "left camera ROIs"):
+                    tracker.run_sequence(tracker.parse_args(cli + ["--initial-rois", str(directory / "drawn_rois.json")]))
+
     def test_collect_image_paths_sorts_by_leading_timestamp_without_changing_files(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -1235,6 +1300,23 @@ class SequenceRoiUpdateTest(unittest.TestCase):
 
 
 class ReviewOverlayTest(unittest.TestCase):
+    def test_global_outline_damps_endpoint_jitter_and_follows_lateral_motion(self):
+        first = np.float32([[20, 20], [60, 20], [60, 180], [20, 180]])
+        moved = first + [18, 12]
+        # The polygon changed its first vertex and winding between frames.
+        outline = tracker.dmt._review_polygon(np.roll(moved[::-1], 1, axis=0), first)
+        np.testing.assert_allclose(outline[:, 0], moved[:, 0], atol=3)
+        np.testing.assert_allclose(outline[:, 1], first[:, 1], atol=3)
+        state = {1: first}
+        gray = np.zeros((240, 160), np.uint8)
+        item = {"roi_idx": 1, "status": "lost", "confidence": "failed", "vertices": moved.tolist()}
+        frame = tracker.make_review_frame(gray, [item], image_path="2.bmp", frame_index=1,
+                                          total_frames=2, tracking=[], review_polygons=state)
+        np.testing.assert_allclose(state[1], outline)
+        np.testing.assert_array_equal(item["vertices"], moved)
+        self.assertTrue((frame[45:, :, 2] == 155).any())  # red LOST badge immediately
+        self.assertFalse(((frame[45:, :, 1] > 200) & (frame[45:, :, 0] > 200) & (frame[45:, :, 2] < 30)).any())
+
     def test_make_review_frame_draws_overlay_at_video_scale(self):
         gray = np.zeros((80, 120), dtype=np.uint8)
         results = [

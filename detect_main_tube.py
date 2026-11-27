@@ -626,7 +626,25 @@ def _paired_wall_support(left: np.ndarray, right: np.ndarray, threshold: float =
     return max(np.count_nonzero(dark_tube), np.count_nonzero(light_tube)) / len(left)
 
 
-def find_edge_pair(crop: np.ndarray, mask: np.ndarray, config: DetectionConfig) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
+def _bright_rim(crop, mask, x, step, threshold):
+    """Rows with a narrow highlight brighter than both flanks of the wall."""
+    rows = np.arange(len(crop))
+    last = crop.shape[1] - 1
+    x = np.rint(x).astype(int).clip(0, last)
+    offsets = np.arange(-2, 3)
+    xs = (x + offsets[:, None]).clip(0, last)
+    peak = np.argmax(crop[rows, xs], axis=0)
+    x = (x + offsets[peak]).clip(0, last)
+    crest = crop[rows, x]
+    # A much wider bright gap beside a railing also looks like a crest at
+    # one offset. A narrow rim falls away on both sides at both distances.
+    near = max(2, step // 2)
+    flanks = np.maximum.reduce([crop[rows, (x + dx).clip(0, last)] for dx in (-step, -near, near, step)])
+    return (crest.astype(np.int16) - flanks > threshold) & (mask[rows, x] > 0)
+
+
+def find_edge_pair(crop: np.ndarray, mask: np.ndarray, config: DetectionConfig,
+                   expected_width: float | None = None) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
     height, width = crop.shape
     evidence, profile = _edge_evidence(crop, mask, config)
     peaks = _find_profile_peaks(profile, config.max_profile_peaks)
@@ -647,7 +665,25 @@ def find_edge_pair(crop: np.ndarray, mask: np.ndarray, config: DetectionConfig) 
         return max(np.count_nonzero(delta > noise_floor),
                    np.count_nonzero(delta < -noise_floor)) >= 0.15 * height
 
+    # Where the sky clips, the true tube outline borders bright background on
+    # both sides. A shading gradient inside the tube only satisfies one side.
+    sky_left = {x: (crop[:, max(0, x-step)] >= 252) & (contrast[x] < -noise_floor) for _, x in peaks}
+    sky_right = {x: (crop[:, min(width-1, x+step)] >= 252) & (contrast[x] > noise_floor) for _, x in peaks}
+    near_steps = {}
+    for _, x in peaks:
+        # Strong edges elsewhere in the ROI can set the gradient percentile
+        # above an entire washed-out wall. Require a repeatable *local* step.
+        near = _wall_contrast(crop, mask, x, max(2, step // 2))
+        near_steps[x] = near
+        silhouette_rows = (sky_left[x] & (near < -noise_floor)) | (sky_right[x] & (near > noise_floor))
+        support[x] = max(support[x], float(np.mean(silhouette_rows)))
     peaks = [(value, x) for value, x in peaks if has_wall(contrast[x]) and support[x] >= 0.15]
+    rim_threshold = max(12, noise_floor)
+    rims = {x: _bright_rim(crop, mask, x, step, rim_threshold) for _, x in peaks}
+    wall_steps = {x: np.median([near_steps[x], _wall_contrast(crop, mask, x, max(2, round(.75 * step))),
+                                contrast[x]], axis=0) for _, x in peaks}
+    sustained = {x: (np.abs(contrast[x]) > rim_threshold)
+                 & (np.sign(contrast[x]) * near_steps[x] > rim_threshold) for _, x in peaks}
     positive_profile = profile[profile > 0]
     background_strength = max(1.0, float(np.median(positive_profile))) if positive_profile.size else 1.0
     best: dict[str, Any] | None = None
@@ -671,7 +707,14 @@ def find_edge_pair(crop: np.ndarray, mask: np.ndarray, config: DetectionConfig) 
                 width_prior = 1.0
 
             score = (left_strength_raw + right_strength_raw) * (0.4 + continuity) * width_prior
-            score *= 0.5 + _paired_wall_support(contrast[left_x], contrast[right_x])
+            pair_support = _paired_wall_support(wall_steps[left_x], wall_steps[right_x])
+            rim_support = max(np.mean(rims[left_x] & sustained[right_x]),
+                              np.mean(rims[right_x] & sustained[left_x]))
+            score *= 0.5 + max(pair_support, rim_support)
+            silhouette = float(np.mean(sky_left[left_x] & sky_right[right_x]))
+            score *= 1 + 3 * silhouette
+            if expected_width:
+                score *= min(tube_width / expected_width, expected_width / tube_width) ** 3
 
             candidate = {
                 "score": float(score),
@@ -682,6 +725,7 @@ def find_edge_pair(crop: np.ndarray, mask: np.ndarray, config: DetectionConfig) 
                 "left_strength": float(profile[left_x]),
                 "right_strength": float(profile[right_x]),
                 "continuity": float(continuity),
+                "silhouette_support": silhouette,
             }
             if best is None or candidate["score"] > best["score"]:
                 best = candidate
@@ -699,7 +743,18 @@ def find_edge_pair(crop: np.ndarray, mask: np.ndarray, config: DetectionConfig) 
     refined = _refine_pair_with_foreground_span(best, peaks, profile, crop, mask, config)
     supported_peaks = {x for _, x in peaks}
     if refined["left_x"] in supported_peaks and refined["right_x"] in supported_peaks:
-        best = refined
+        silhouette = float(np.mean(sky_left[refined["left_x"]] & sky_right[refined["right_x"]]))
+        # The dark foreground mask can connect the pipe to a crossing girder.
+        # Its proposed wider pair must retain evidence for each moved wall.
+        supported = all(refined[f"{side}_x"] == best[f"{side}_x"] or (
+            refined[f"{side}_strength"] >= .30 * best[f"{side}_strength"]
+            and support[refined[f"{side}_x"]] >= .5 * support[best[f"{side}_x"]]
+        ) for side in ("left", "right"))
+        width_consistent = (not expected_width or
+                            abs(refined["tube_width_px"] - expected_width) <=
+                            max(.08 * expected_width, abs(best["tube_width_px"] - expected_width)))
+        if width_consistent and silhouette >= best["silhouette_support"] - 0.15 and (supported or silhouette >= .5):
+            best = {**refined, "silhouette_support": silhouette}
     # Confidence describes the pair. A single strong peak in blank sky must
     # not compensate for a missing second boundary.
     best["continuity"] = min(support[best["left_x"]], support[best["right_x"]])
@@ -711,7 +766,7 @@ def find_edge_pair(crop: np.ndarray, mask: np.ndarray, config: DetectionConfig) 
         and 0.38 <= best["tube_width_frac"] <= 0.84
     ):
         confidence = "high"
-    elif best["continuity"] >= 0.25 and best["edge_contrast"] >= 1.6:
+    elif (best["continuity"] >= 0.25 and best["edge_contrast"] >= 1.6) or best["silhouette_support"] >= 0.40:
         confidence = "medium"
     else:
         confidence = "low"
@@ -740,7 +795,7 @@ def _fit_one_boundary_line(
     x0 = max(0, expected_x - search_radius)
     x1 = min(width, expected_x + search_radius + 1)
     columns = np.arange(x0, x1, dtype=np.float32)
-    weights_x = np.exp(-0.5 * ((columns - expected_x) / max(2.0, search_radius / 2.0)) ** 2)
+    weights_x = np.exp(-0.5 * ((columns - expected_x) / max(2.0, search_radius / 3.0)) ** 2)
     band = np.where(mask[:, x0:x1], evidence[:, x0:x1], 0)
     peaks = np.argmax(band * weights_x, axis=1)
     strengths = band[np.arange(height), peaks]
@@ -798,6 +853,9 @@ def _fit_boundary_lines(
     mask: np.ndarray,
     left_x: int,
     right_x: int,
+    crop: np.ndarray,
+    profile: np.ndarray,
+    peaks: list[dict[str, Any]],
 ) -> tuple[BoundaryLineModel | None, BoundaryLineModel | None]:
     height, width = evidence.shape
     tube_width = max(1, int(right_x) - int(left_x))
@@ -809,19 +867,72 @@ def _fit_boundary_lines(
         return None, None
 
     min_strength = float(np.percentile(positive_evidence, 70))
-    left_model = _fit_one_boundary_line(evidence, mask, int(left_x), search_radius, min_strength)
-    right_model = _fit_one_boundary_line(evidence, mask, int(right_x), search_radius, min_strength)
+    # Follow the polarity of the selected step. The near edge of a parallel
+    # railing across a bright gap has the opposite sign from the pipe wall.
+    gx = cv2.Sobel(crop, cv2.CV_16S, 1, 0)
+    def fit(x):
+        step = max(2, min(5, round(tube_width * .05)))
+        delta = _wall_contrast(crop, mask, x, step)
+        polarity = np.sign(np.count_nonzero(delta > 2) - np.count_nonzero(delta < -2))
+        signed_evidence = evidence
+        if polarity:
+            opposite = gx < 0 if polarity > 0 else gx > 0
+            signed_evidence = np.where(opposite, 0, evidence)
+        # Do not let a stronger neighboring ridge pull rows out of the basin
+        # of the chosen peak (e.g. the second edge of a parallel railing).
+        gaps = [abs(p["x"] - x) for p in peaks if p["x"] != x and p["value"] >= .6 * profile[x]]
+        radius = min(search_radius, max(4, round(.6 * min(gaps)))) if gaps else search_radius
+        return _fit_one_boundary_line(signed_evidence, mask, x, radius, min_strength)
+
+    left_model, right_model = fit(left_x), fit(right_x)
     if left_model is None or right_model is None:
         return None, None
 
     if abs(left_model.slope - right_model.slope) > 0.20:
         return None, None
 
+    # When a wire crosses one wall almost lengthwise, it can supply hundreds
+    # of rows with the wrong slope. Prefer the tightly localized opposite wall.
+    models = [left_model, right_model]
+    weights = [model.support_rows / (.5 + model.median_residual) ** 2 for model in models]
+    strong = int(weights[1] > weights[0])
+    weak = 1 - strong
+    mid_y = (height - 1) / 2.0
+    slopes_disagree = abs(left_model.slope - right_model.slope) * height > 3
+    weak_peak = (left_x, right_x)[weak]
+    displaced = abs(models[weak].x_at(mid_y) - weak_peak) > 2
+    if slopes_disagree or (displaced and weights[strong] > 2 * weights[weak]):
+        # Vote at parallel offsets over the full length. Taking unsigned
+        # gradients allows a wall to pass from bright sky to dark steelwork.
+        radius = min(search_radius, max(2, round(.08 * tube_width)))
+        offsets = np.arange(-radius, radius + 1)
+        rows = np.arange(0, height, 2)[:, None]
+        slopes = (left_model.slope, right_model.slope) if slopes_disagree else (models[strong].slope,)
+        best_score = 0.0
+        best_pair = None
+        for slope in slopes:
+            pair = []
+            score = 1.0
+            for x, model in zip((left_x, right_x), models, strict=True):
+                cols = np.rint(x + (rows - mid_y) * slope + offsets).astype(int).clip(0, width - 1)
+                band = np.where(mask[rows, cols], evidence[rows, cols], 0)
+                votes = np.minimum(band, np.percentile(band.max(axis=1), 75)).mean(axis=0)
+                peak = np.argmax(votes)
+                score *= float(votes[peak])
+                parallel = model
+                if model.slope != slope:
+                    parallel = _with_parallel_slope(model, slope, mid_y)
+                    parallel.intercept = float(x + offsets[peak] - slope * mid_y)
+                pair.append(parallel)
+            if score > best_score:
+                best_score, best_pair = score, pair
+        if best_pair is not None:
+            return best_pair[0], best_pair[1]
+
     total_support = left_model.support_rows + right_model.support_rows
     parallel_slope = (
         left_model.slope * left_model.support_rows + right_model.slope * right_model.support_rows
-    ) / max(1, total_support)
-    mid_y = (height - 1) / 2.0
+    ) / total_support
     return _with_parallel_slope(left_model, parallel_slope, mid_y), _with_parallel_slope(
         right_model,
         parallel_slope,
@@ -1114,7 +1225,21 @@ def detect_roi(gray: np.ndarray, roi: dict[str, Any], config: DetectionConfig | 
     except (ValueError, cv2.error):
         return _failed_roi_result(roi_idx, points, "invalid or oversized roi"), {}
 
-    pair, profile, evidence = find_edge_pair(crop, mask, config)
+    expected_width = roi.get("expected_width")
+    search_crop = crop
+    if expected_width:
+        # A thin upright in a bright gap can merge with the pipe in the
+        # smoothed gradient profile. Close only narrow dark structures, and
+        # only when one persists along the outer part of the search window.
+        kernel = np.ones((1, 2 * max(2, round(.10 * expected_width)) + 1), np.uint8)
+        closed = cv2.morphologyEx(crop, cv2.MORPH_CLOSE, kernel)
+        sample = closed[::4]
+        filled = (sample >= 200) & (cv2.subtract(sample, crop[::4]) >= 32) & (mask[::4] > 0)
+        extent = max(1, round(crop.shape[1] * .35))
+        coverage = filled.mean(axis=0)
+        if max(coverage[:extent].max(), coverage[-extent:].max()) >= .30:
+            search_crop = closed
+    pair, profile, evidence = find_edge_pair(search_crop, mask, config, expected_width)
 
     result: dict[str, Any] = {
         "roi_idx": roi_idx,
@@ -1129,6 +1254,9 @@ def detect_roi(gray: np.ndarray, roi: dict[str, Any], config: DetectionConfig | 
             mask,
             int(pair["left_x"]),
             int(pair["right_x"]),
+            search_crop,
+            profile,
+            pair["candidate_peaks"],
         )
         if left_model is not None and right_model is not None:
             result["left_line"] = {
@@ -1147,9 +1275,38 @@ def detect_roi(gray: np.ndarray, roi: dict[str, Any], config: DetectionConfig | 
         step = max(3, min(12, round(pair["tube_width_px"] * 0.12)))
         left_cols = left_model.slope * rows + left_model.intercept if left_model else pair["left_x"]
         right_cols = right_model.slope * rows + right_model.intercept if right_model else pair["right_x"]
-        left_step = _wall_contrast(crop, mask, left_cols, step)
-        right_step = _wall_contrast(crop, mask, right_cols, step)
+        # A narrow neighboring railing can coincide with one sampling offset.
+        # Require agreement at two of three distances on each measured wall.
+        def wall_step(cols):
+            radii = (max(2, step // 2), max(2, round(.75 * step)), step)
+            native = np.median([_wall_contrast(crop, mask, cols, radius) for radius in radii], axis=0)
+            if search_crop is crop:
+                return native
+            cleared = np.median([_wall_contrast(search_crop, mask, cols, radius) for radius in radii], axis=0)
+            # The original image must show the same step at the fitted wall.
+            direct = _wall_contrast(crop, mask, cols, 2)
+            return np.where(np.sign(cleared) * direct > pair["wall_noise_floor"], cleared, native)
+        left_step = wall_step(left_cols)
+        right_step = wall_step(right_cols)
         result["wall_pair_coverage"] = _paired_wall_support(left_step, right_step, pair["wall_noise_floor"])
+        segment = slice(0, 0)
+        if left_model and right_model:
+            start = int(max(left_model.support_y_min, right_model.support_y_min))
+            stop = 1 + int(min(left_model.support_y_max, right_model.support_y_max))
+            if stop > start:
+                segment = slice(start, stop)
+                result["segment_wall_pair_coverage"] = _paired_wall_support(
+                    left_step[segment], right_step[segment], pair["wall_noise_floor"])
+        if left_model and right_model and expected_width and abs(pair["tube_width_px"] / expected_width - 1) <= .10:
+            # A specular rim can be brighter than both the pipe and the
+            # background. Count it only alongside a separately measured wall.
+            threshold = max(12, pair["wall_noise_floor"])
+            for cols, other_step in ((left_cols, right_step), (right_cols, left_step)):
+                supported = _bright_rim(crop, mask, cols, step, threshold) & (np.abs(other_step) > threshold)
+                result["wall_pair_coverage"] = max(result["wall_pair_coverage"], float(supported.mean()))
+                if "segment_wall_pair_coverage" in result:
+                    result["segment_wall_pair_coverage"] = max(result["segment_wall_pair_coverage"],
+                                                               float(supported[segment].mean()))
         center_offset_x, centerline_info = _foreground_centerline_offset(
             crop,
             mask,
@@ -1158,7 +1315,7 @@ def detect_roi(gray: np.ndarray, roi: dict[str, Any], config: DetectionConfig | 
             config,
             left_model,
             right_model,
-            _paired_wall_support(left_step, right_step),
+            result["wall_pair_coverage"],
         )
         left, right, center = _sample_boundaries(
             meta,
@@ -1192,7 +1349,68 @@ def detect_roi(gray: np.ndarray, roi: dict[str, Any], config: DetectionConfig | 
     return result, debug
 
 
-def draw_overlay(gray: np.ndarray, results: list[dict[str, Any]]) -> np.ndarray:
+def draw_roi_label(image, vertices, label, scale, color, lost, anchor=None):
+    # Fit the entire badge inside the visible polygon, including diagonal and
+    # partially cropped ROIs. Work only in its local bounding rectangle.
+    vertices = np.asarray(vertices, dtype=np.int32).reshape(-1, 2)
+    x, y = np.maximum(vertices.min(axis=0), 0)
+    end_x, end_y = np.minimum(vertices.max(axis=0) + 1, image.shape[1::-1])
+    if end_x <= x or end_y <= y:
+        return False
+    mask = np.zeros((end_y - y, end_x - x), np.uint8)
+    cv2.fillPoly(mask, [vertices - [int(x), int(y)]], 255)
+    layouts = [[label]]
+    if " " in label:
+        layouts.append(label.split())
+    for lines in layouts:
+        font_scale = scale
+        while font_scale >= .20:
+            sizes = [cv2.getTextSize(line, 0, font_scale, 1) for line in lines]
+            width = max(size[0][0] for size in sizes) + 5
+            (_, th), baseline = sizes[0]
+            line_height = th + baseline + 2
+            height = len(lines) * line_height + 2
+            if width <= mask.shape[1] and height <= mask.shape[0]:
+                valid = cv2.erode(mask, np.ones((height, width), np.uint8), anchor=(0, 0),
+                                  borderType=cv2.BORDER_CONSTANT, borderValue=0)
+                ys = np.flatnonzero(valid.any(axis=1))
+                if ys.size:
+                    row = (ys[len(ys) // 8] if anchor is None else
+                           ys[np.argmin(np.abs(ys - (anchor[1] - y - height / 2)))])
+                    xs = np.flatnonzero(valid[row])
+                    col = (xs[len(xs) // 2] if anchor is None else
+                           xs[np.argmin(np.abs(xs - (anchor[0] - x - width / 2)))])
+                    px, py = int(x + col), int(y + row)
+                    cv2.rectangle(image, (px, py), (px + width - 1, py + height - 1),
+                                  (0, 0, 155) if lost else (25, 25, 25), -1)
+                    for index, line in enumerate(lines):
+                        origin = (px + 2, py + th + 1 + index * line_height)
+                        cv2.putText(image, line, origin, 0, font_scale, color, 1, cv2.LINE_AA)
+                    return True
+            font_scale *= .75
+    return False
+
+
+def _review_polygon(vertices, previous):
+    points = np.asarray(vertices, dtype=np.float32)
+    if previous is None or points.shape != previous.shape:
+        return points.copy()
+    # The same polygon can be returned with another first corner or winding.
+    if cv2.contourArea(points, oriented=True) * cv2.contourArea(previous, oriented=True) < 0:
+        points = points[::-1]
+    offset = (points - points.mean(axis=0)) - (previous[0] - previous.mean(axis=0))
+    points = np.roll(points, -np.argmin(np.linalg.norm(offset, axis=1)), axis=0)
+    basis = _basis_from_polygon(points)
+    axes = np.stack((basis.short_axis, basis.long_axis))
+    extent = np.ptp(points @ axes.T, axis=0)
+    # Visible length varies under occlusion. Smooth more along the pipe and
+    # limit lateral lag so the outline follows actual sideways motion.
+    lag = .82 * ((previous - points) @ axes.T)
+    limit = extent * [.07, .18]
+    return (points + np.clip(lag, -limit, limit) @ axes).astype(np.float32)
+
+
+def draw_overlay(gray: np.ndarray, results: list[dict[str, Any]], *, review_polygons=None) -> np.ndarray:
     overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     confidence_color = {
         "high": (0, 255, 0),
@@ -1203,7 +1421,14 @@ def draw_overlay(gray: np.ndarray, results: list[dict[str, Any]]) -> np.ndarray:
 
     line_width = max(2, round(min(gray.shape[:2]) / 1100))
     for result in results:
-        vertices = np.asarray(result["vertices"], dtype=np.int32)
+        vertices = result["vertices"]
+        anchor = None
+        if review_polygons is not None:
+            idx = result["roi_idx"]
+            vertices = _review_polygon(vertices, review_polygons.get(idx))
+            review_polygons[idx] = vertices
+            anchor = (vertices.mean(axis=0) + vertices[0]) / 2
+        vertices = np.asarray(vertices, dtype=np.int32)
         lost = result["status"] == "lost"
         color = (0, 0, 255) if lost else confidence_color.get(result["confidence"], (0, 0, 255))
         cv2.polylines(overlay, [vertices], True, (145, 145, 145), 1, cv2.LINE_AA)
@@ -1215,21 +1440,8 @@ def draw_overlay(gray: np.ndarray, results: list[dict[str, Any]]) -> np.ndarray:
                     cv2.polylines(overlay, [pts], False, line_color, line_width, cv2.LINE_AA)
 
         label = f"R{result['roi_idx']} {'LOST' if lost else result['confidence']}"
-        scale = max(0.5, min(gray.shape[:2]) / 1900)
-        (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
-        x = int(np.clip(vertices[:, 0].min(), 0, max(0, gray.shape[1] - tw - 6)))
-        y = int(np.clip(vertices[:, 1].min() - 4, th + 4, max(th + 4, gray.shape[0] - baseline)))
-        cv2.rectangle(overlay, (x, y-th-3), (x+tw+5, y+baseline), (0, 0, 155) if lost else (25, 25, 25), -1)
-        cv2.putText(
-            overlay,
-            label,
-            (x + 2, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            scale,
-            (255, 255, 255) if lost else color,
-            2,
-            cv2.LINE_AA,
-        )
+        scale = min(.85, max(.4, min(gray.shape[:2]) / 4800))
+        draw_roi_label(overlay, vertices, label, scale, (255, 255, 255) if lost else color, lost, anchor)
     return overlay
 
 

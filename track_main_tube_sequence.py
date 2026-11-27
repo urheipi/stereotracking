@@ -12,6 +12,7 @@ import argparse
 import re
 from datetime import datetime
 from pathlib import Path
+from tempfile import mkdtemp
 from typing import Any, Sequence
 
 import cv2
@@ -57,6 +58,13 @@ def collect_image_paths(image_dir: str | Path, pattern: str, sort_by: str = "tim
 def default_output_json_name(run_timestamp: str | None = None) -> str:
     timestamp = run_timestamp or make_output_timestamp()
     return f"{DEFAULT_OUTPUT_JSON_STEM}_{timestamp}{DEFAULT_OUTPUT_JSON_SUFFIX}"
+
+
+def camera_from_path(path: str | Path) -> str | None:
+    folders = {"trackingright": "right", "right_camera": "right", "right": "right",
+               "trackingleft": "left", "trackingbmp": "left", "testbmp": "left",
+               "left_camera": "left", "left": "left"}
+    return next((folders[p.lower()] for p in reversed(Path(path).parts) if p.lower() in folders), None)
 
 
 def resolve_output_json(
@@ -128,8 +136,9 @@ def make_review_frame(
     total_frames: int,
     tracking: list[dict[str, Any]],
     video_scale: float = 1.0,
+    review_polygons=None,
 ) -> np.ndarray:
-    frame = dmt.draw_overlay(gray, results)
+    frame = dmt.draw_overlay(gray, results, review_polygons=review_polygons)
     ok_count = sum(1 for result in results if result.get("status") == "ok")
     header = (
         f"{frame_index + 1}/{total_frames}  {Path(image_path).name}  "
@@ -255,8 +264,13 @@ def _template_match_roi_transform(
     max_roi_jump: float | None,
     *,
     min_score: float = 0.40,
+    context: bool = False,
 ) -> tuple[np.ndarray | None, dict[str, Any]]:
     points = np.asarray(vertices, dtype=np.float32).reshape(-1, 2)
+    if context:
+        center, (a, b), angle = cv2.minAreaRect(points)
+        pad = min(a, b)
+        points = cv2.boxPoints((center, (a + 2 * pad, b + 2 * pad), angle))
     height, width = prev_gray.shape[:2]
     x0 = max(0, int(np.floor(float(points[:, 0].min()))))
     y0 = max(0, int(np.floor(float(points[:, 1].min()))))
@@ -445,6 +459,16 @@ def _estimate_roi_transform(
     if matrix is None or footprint < np.linalg.norm(np.ptp(vertices, axis=0)) / 3:
         delta = np.median(tracked_next - tracked_prev, axis=0)
         matrix = np.asarray([[1.0, 0.0, delta[0]], [0.0, 1.0, delta[1]]], dtype=np.float32)
+
+    if inlier_count < max(8, .55 * len(prev_points)):
+        center, (a, b), _ = cv2.minAreaRect(vertices)
+        shift = matrix[:, :2] @ center + matrix[:, 2] - center
+        zoom = np.linalg.norm(matrix[0, :2])
+        # Clusters on wires near opposite ends can imply a large zoom or
+        # slide along a nearly textureless pipe. Include its surroundings
+        # to distinguish translations that match the pipe equally well.
+        if not .90 <= zoom <= 1.10 or np.linalg.norm(shift) > max(8., .35 * min(a, b)):
+            return _template_match_roi_transform(prev_gray, next_gray, vertices, max_roi_jump, context=True)
 
     return matrix.astype(np.float32), {
         "status": "ok",
@@ -701,6 +725,27 @@ def _roi_axes(vertices: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]
     long_axis = sides[0][1].astype(np.float32)
     short_axis = np.asarray([-long_axis[1], long_axis[0]], dtype=np.float32)
     return points.mean(axis=0), long_axis, short_axis
+
+
+def _preserve_search_extent(roi, width, reference):
+    """Keep both walls in the search after many small flow-scale errors."""
+    initial_width, initial_length = reference
+    points = np.asarray(roi["vertices"], dtype=np.float32)
+    axes = _roi_axes(points)
+    if axes is None:
+        return
+    center, along, across = axes
+    xy = points - center
+    length, breadth = np.ptp(xy @ along), np.ptp(xy @ across)
+    if min(length, breadth) < 1:
+        return
+    # Allow foreshortening and zoom. Scale the original selected length by
+    # observed pipe width, independent of the number of processed frames.
+    long_gain = max(1., .85 * initial_length * width / initial_width / length)
+    short_gain = max(1., 1.30 * width / breadth)
+    if long_gain > 1.001 or short_gain > 1.001:
+        points = center + (xy @ along)[:, None] * along * long_gain + (xy @ across)[:, None] * across * short_gain
+        roi["vertices"] = _format_vertices(points)
 
 
 def _ensure_min_roi_short_span(vertices: list[list[float]], min_short_span: float) -> list[list[float]]:
@@ -1270,13 +1315,29 @@ def assess_visibility(
     return visible
 
 
-def reject_invalid_updates(results, updates, candidates):
-    rejected = {u["roi_idx"]: u["update_status"] for u in updates if u["update_status"].startswith("rejected-")}
+def reject_invalid_updates(results, updates, candidates, confirmed_widths=None):
+    rejected = {u["roi_idx"]: u for u in updates if u["update_status"].startswith("rejected-")}
     for i, result in enumerate(results):
         idx = result["roi_idx"]
         if idx in rejected:
+            update = rejected[idx]
+            reason = update["update_status"]
+            width = (confirmed_widths or {}).get(idx)
+            if width and result["status"] == "ok":
+                ratio = result["tube_width_px"] / width
+                if reason == "rejected-exposure-shrink" and .78 <= ratio <= 1.28:
+                    continue
+                # Only the search window would shrink. Publish the shorter
+                # measured segment if both fitted walls still establish its width.
+                if (reason == "rejected-corrected-roi-shrink" and .9 <= ratio <= 1.1
+                        and update["roi_long_span_ratio"] >= .60
+                        and result.get("segment_wall_pair_coverage", result["wall_pair_coverage"]) >= .50):
+                    height = result["rectified_size"]["height"]
+                    if all(result.get(key, {}).get("support_rows", 0) >= height / 3
+                           for key in ("left_line", "right_line")):
+                        continue
             if result["status"] == "ok":
-                results[i] = _lost_measurement(result, rejected[idx])
+                results[i] = _lost_measurement(result, reason)
             candidates[idx] = None
 
 
@@ -1294,8 +1355,28 @@ def load_initial_roi_payload(
         dmt.save_json(rois_source, roi_payload)
         return roi_payload, rois_source
 
+    camera = getattr(args, "camera", None) or camera_from_path(Path(first_image_path).parent)
+    if not args.initial_rois:
+        first = Path(first_image_path).resolve()
+        root = Path(DEFAULT_OUTPUT_DIR)
+        candidates = sorted((root / "runs" / f"{camera}_camera").glob("*/drawn_rois.json"), reverse=True)
+        if camera == "left" and first.parent.name.lower() == "testbmp":
+            candidates.insert(0, root / "drawn_rois.json")
+        for candidate in candidates:
+            if candidate.is_file():
+                saved = dmt.load_roi_json(candidate)
+                if saved.get("image") and Path(saved["image"]).resolve() == first:
+                    print(f"Using saved ROIs: {candidate}", flush=True)
+                    return dmt.normalize_roi_payload(saved), candidate
+        raise ValueError("No saved ROIs for this camera and first image. "
+                         "Pass -InitialRois or use -Interactive to select the pipes.")
     rois_source = Path(args.initial_rois)
-    return dmt.normalize_roi_payload(dmt.load_roi_json(rois_source)), rois_source
+    payload = dmt.normalize_roi_payload(dmt.load_roi_json(rois_source))
+    source_camera = camera_from_path(rois_source.parent) or camera_from_path(payload.get("image") or "")
+    if source_camera and camera and source_camera != camera:
+        raise ValueError(f"{camera} camera input has {source_camera} camera ROIs. "
+                         "Select its drawn_rois.json with -InitialRois or draw new ROIs with -Interactive.")
+    return payload, rois_source
 
 
 def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
@@ -1310,10 +1391,28 @@ def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("At least two ordered frames are required.")
 
     run_timestamp = getattr(args, "run_timestamp", None) or make_output_timestamp()
+    saved_rois = None
+    if not getattr(args, "draw_rois", False):
+        saved_rois = load_initial_roi_payload(args, image_paths[0], args.out_dir or DEFAULT_OUTPUT_DIR)
+    if args.out_dir is None and not args.out_json and not args.out_video:
+        camera = getattr(args, "camera", None) or camera_from_path(image_paths[0].parent)
+        if camera is None and saved_rois:
+            camera = camera_from_path(saved_rois[1].parent) or camera_from_path(saved_rois[0].get("image") or "")
+        if camera is None:
+            raise ValueError("Unknown camera folder. Pass -Camera left/right to the launcher "
+                             "(--camera left/right in Python), or specify an output directory.")
+        run_root = Path(DEFAULT_OUTPUT_DIR) / "runs" / f"{camera}_camera"
+        run_dir = run_root / f"{run_timestamp}_{datetime.now().microsecond // 1000:03d}"
+        try:
+            run_dir.mkdir(parents=True)
+        except FileExistsError:
+            run_dir = Path(mkdtemp(prefix=f"{run_timestamp}_", dir=run_root))
+        args.out_dir = run_dir
+        print(f"Output folder: {args.out_dir}", flush=True)
     out_json = resolve_output_json(args.out_json, args.out_dir, run_timestamp=run_timestamp)
     args._resolved_out_json = out_json
     args._run_timestamp = run_timestamp
-    roi_payload, rois_source = load_initial_roi_payload(args, image_paths[0], out_json.parent)
+    roi_payload, rois_source = saved_rois or load_initial_roi_payload(args, image_paths[0], out_json.parent)
     config = dmt.DetectionConfig(
         min_width_frac=args.min_width_frac,
         max_width_frac=args.max_width_frac,
@@ -1357,14 +1456,18 @@ def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
         reject_invalid_updates(results, roi_updates, candidates)
         _apply_roi_vertices_to_results(results, roi_payload)
     anchor_roi_payload = dmt.normalize_roi_payload(roi_payload)
+    confirmed_widths = {r["roi_idx"]: r["tube_width_px"] for r in results if r["status"] == "ok"}
+    search_references = {r["roi_idx"]: (confirmed_widths[r["roi_idx"]], _roi_long_span(r["vertices"]))
+                         for r in roi_payload["rois"] if r["roi_idx"] in confirmed_widths}
     roi_span_history = update_roi_span_history({}, roi_payload)
     frames = [make_frame_centerline_summary(image_paths[0], rois_source, results)]
     if diagnostics:
         add_evidence(frames[-1], raw_results, previous_exposure_stats)
     _emit_progress(0, len(image_paths), image_paths[0], results, getattr(args, "progress_every", 0))
+    review_polygons = {}
     overlay = (
         make_review_frame(prev_gray, results, image_path=image_paths[0], frame_index=0,
-                          total_frames=len(image_paths), tracking=[])
+                          total_frames=len(image_paths), tracking=[], review_polygons=review_polygons)
         if args.window or args.video else None
     )
     display_frame = overlay if args.window else None
@@ -1412,6 +1515,11 @@ def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
                 track_group_outlier_min_dy=getattr(args, "track_group_outlier_min_dy", 0.0),
                 track_group_outlier_dy_deviation=getattr(args, "track_group_outlier_dy_deviation", 45.0),
             )
+            for roi in predicted_roi_payload["rois"]:
+                idx = roi["roi_idx"]
+                roi["expected_width"] = confirmed_widths.get(idx)
+                if args.roi_update_mode == "detect-corrected" and idx in search_references:
+                    _preserve_search_extent(roi, confirmed_widths[idx], search_references[idx])
             raw_results, _ = dmt.detect_all(next_gray, predicted_roi_payload, config, debug_panels_enabled=False)
             results = assess_visibility(raw_results, candidates, previous_roi_payload, predicted_roi_payload, jump_limit, diagnostics)
             if args.roi_update_mode == "detect-corrected":
@@ -1455,11 +1563,19 @@ def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
                     long_span_drop_threshold=getattr(args, "history_long_span_drop", 80.0),
                     short_span_ratio_threshold=getattr(args, "history_short_span_ratio", 0.85),
                 )
-                reject_invalid_updates(results, roi_updates, candidates)
+                reject_invalid_updates(results, roi_updates, candidates, confirmed_widths)
                 _apply_roi_vertices_to_results(results, roi_payload)
                 tracking = _merge_roi_update_info(tracking, roi_updates)
             else:
                 roi_payload = predicted_roi_payload
+            held_widths = {t["roi_idx"] for t in tracking if t.get("update_status") in
+                           {"rejected-exposure-shrink", "rejected-corrected-roi-shrink"}}
+            for result in results:
+                if result["status"] == "ok" and result["roi_idx"] not in held_widths:
+                    idx = result["roi_idx"]
+                    confirmed_widths[idx] = result["tube_width_px"]
+                    if idx not in search_references:
+                        search_references[idx] = (confirmed_widths[idx], _roi_long_span(result["vertices"]))
             roi_span_history = update_roi_span_history(roi_span_history, roi_payload)
             frames.append(
                 make_frame_centerline_summary(
@@ -1474,7 +1590,7 @@ def run_sequence(args: argparse.Namespace) -> dict[str, Any]:
             _emit_progress(frame_index, len(image_paths), image_path, results, getattr(args, "progress_every", 0))
             overlay = (
                 make_review_frame(next_gray, results, image_path=image_path, frame_index=frame_index,
-                                  total_frames=len(image_paths), tracking=tracking)
+                                  total_frames=len(image_paths), tracking=tracking, review_polygons=review_polygons)
                 if reviewer is not None or writer is not None else None
             )
             display_frame = overlay if reviewer is not None else None
@@ -1528,16 +1644,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="timestamp",
         help="Ordering for --image-dir. timestamp sorts by leading digits in each filename.",
     )
-    roi_source = parser.add_mutually_exclusive_group(required=True)
+    roi_source = parser.add_mutually_exclusive_group()
     roi_source.add_argument("--initial-rois", help="First-frame ROI JSON path.")
     roi_source.add_argument("--draw-rois", action="store_true", help="Draw first-frame ROIs interactively.")
     parser.add_argument("--out-json", default=None, help="Combined centerline JSON output path.")
     parser.add_argument("--out-video", default=None, help="Review video output path.")
+    parser.add_argument("--camera", choices=("left", "right"), help="Camera for the default run directory.")
     parser.add_argument(
         "--out-dir",
         default=None,
         help=(
-            "Directory for generated outputs. Defaults to tracking_results for generated filenames. "
+            "Directory for generated outputs. Defaults to tracking_results/runs/<camera>_camera/<run>. "
             "Relative paths are resolved from the current working directory."
         ),
     )
